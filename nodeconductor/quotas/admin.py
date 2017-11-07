@@ -1,7 +1,10 @@
+from django.conf import settings
 from django.contrib import admin
-from django.contrib.contenttypes import models as ct_models, generic
+from django.contrib.contenttypes.admin import GenericTabularInline
+from django.contrib.contenttypes import models as ct_models
+from django.forms import ModelForm
 
-from nodeconductor.core.admin import ReversionAdmin
+from nodeconductor.core.admin import ReversionAdmin, ReadonlyTextWidget
 from nodeconductor.quotas import models, utils
 
 
@@ -23,17 +26,47 @@ class QuotaScopeClassListFilter(admin.SimpleListFilter):
         return queryset
 
 
-class QuotaAdmin(ReversionAdmin):
+class QuotaFieldTypeLimit(object):
+    fields = ('name', 'limit', 'usage', 'quota_field_type')
+    readonly_fields = ('name', 'usage', 'quota_field_type')
+
+    def quota_field_type(self, obj):
+        field = obj.get_field()
+        if field:
+            return field.__class__.__name__
+        return ''
+
+
+class QuotaForm(ModelForm):
+    class Meta:
+        model = models.Quota
+        fields = ('name', 'limit', 'usage')
+
+    def __init__(self, *args, **kwargs):
+        super(QuotaForm, self).__init__(*args, **kwargs)
+
+        if (self.instance
+                and self._is_backend_quota_field(self.instance)
+                and not settings.NODECONDUCTOR['BACKEND_FIELDS_EDITABLE']):
+            self.fields['limit'].widget = ReadonlyTextWidget()
+
+    def _is_backend_quota_field(self, quota):
+        if not quota.scope:
+            return False
+
+        field = getattr(quota.scope.Quotas, quota.name)
+        return field.is_backend
+
+
+class QuotaAdmin(QuotaFieldTypeLimit, ReversionAdmin):
     list_display = ['scope', 'name', 'limit', 'usage']
     list_filter = ['name', QuotaScopeClassListFilter]
 
 
-class QuotaInline(generic.GenericTabularInline):
+class QuotaInline(QuotaFieldTypeLimit, GenericTabularInline):
     model = models.Quota
-    fields = ('name', 'limit', 'usage')
-    readonly_fields = ('name',)
+    form = QuotaForm
     extra = 0
     can_delete = False
-
 
 admin.site.register(models.Quota, QuotaAdmin)

@@ -1,19 +1,15 @@
-.. image:: https://travis-ci.org/opennode/nodeconductor.svg?branch=develop
-    :target: https://travis-ci.org/opennode/nodeconductor
+.. image:: https://travis-ci.org/opennode/waldur-core.svg?branch=develop
+    :target: https://travis-ci.org/opennode/waldur-core
     :alt: Build status
 
-.. image:: https://readthedocs.org/projects/nodeconductor/badge/?version=stable
-    :target: https://readthedocs.org/projects/nodeconductor/?badge=stable
-    :alt: Documentation Status
+Waldur Core
+===========
 
-NodeConductor
-=============
-
-NodeConductor is an open-source RESTful server for multi-tenant resource management. It provides an
+Waldur Core is an open-source RESTful server for multi-tenant resource management. It provides an
 easy way for sharing access to external systems. It is used as a platform for creating private and
 public clouds.
 
-Additional information can be found at http://nodeconductor.readthedocs.org.
+Additional information can be found at http://docs.waldur.com.
 
 Support
 =======
@@ -24,4 +20,4 @@ Professional support options are available. Please contact info@opennodecloud.co
 Development environment setup
 -----------------------------
 
-Instructions here: http://nodeconductor.readthedocs.org/en/latest/guide/intro.html#installation-from-source.
+Instructions here: https://github.com/opennode/waldur-core/blob/develop/docs/guide/install-from-src.rst.

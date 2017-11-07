@@ -1,7 +1,7 @@
 from django.utils import six
 
 from nodeconductor.core.models import User
-from nodeconductor.logging.log import EventLogger, event_logger
+from nodeconductor.logging.loggers import EventLogger, event_logger
 from nodeconductor.structure import models
 
 
@@ -12,36 +12,21 @@ class CustomerEventLogger(EventLogger):
         event_types = ('customer_deletion_succeeded',
                        'customer_update_succeeded',
                        'customer_creation_succeeded')
-
-
-class BalanceEventLogger(EventLogger):
-    customer = models.Customer
-    amount = float
-
-    class Meta:
-        event_types = ('customer_account_credited',
-                       'customer_account_debited')
+        event_groups = {
+            'customers': event_types,
+        }
 
 
 class ProjectEventLogger(EventLogger):
     project = models.Project
-    project_group = models.ProjectGroup
-    project_previous_name = six.text_type
 
     class Meta:
-        nullable_fields = ['project_group', 'project_previous_name']
         event_types = ('project_deletion_succeeded',
                        'project_update_succeeded',
                        'project_creation_succeeded')
-
-
-class ProjectGroupEventLogger(EventLogger):
-    project_group = models.ProjectGroup
-
-    class Meta:
-        event_types = ('project_group_deletion_succeeded',
-                       'project_group_update_succeeded',
-                       'project_group_creation_succeeded')
+        event_groups = {
+            'projects': event_types,
+        }
 
 
 class CustomerRoleEventLogger(EventLogger):
@@ -52,45 +37,24 @@ class CustomerRoleEventLogger(EventLogger):
 
     class Meta:
         event_types = 'role_granted', 'role_revoked'
+        event_groups = {
+            'customers': event_types,
+            'users': event_types,
+        }
 
 
 class ProjectRoleEventLogger(EventLogger):
     project = models.Project
-    project_group = models.ProjectGroup
-    affected_user = User
-    structure_type = six.text_type
-    role_name = six.text_type
-
-    class Meta:
-        nullable_fields = ['project_group']
-        event_types = 'role_granted', 'role_revoked'
-
-
-class ProjectGroupRoleEventLogger(EventLogger):
-    project_group = models.ProjectGroup
     affected_user = User
     structure_type = six.text_type
     role_name = six.text_type
 
     class Meta:
         event_types = 'role_granted', 'role_revoked'
-
-
-class ProjectGroupMembershipEventLogger(EventLogger):
-    project = models.Project
-    project_group = models.ProjectGroup
-
-    class Meta:
-        event_types = 'project_added_to_project_group', 'project_removed_from_project_group'
-
-
-class LicensesEventLogger(EventLogger):
-    resource = models.Resource
-    license_name = six.text_type
-    license_type = six.text_type
-
-    class Meta:
-        event_types = 'resource_license_added',
+        event_groups = {
+            'projects': event_types,
+            'users': event_types,
+        }
 
 
 class UserOrganizationEventLogger(EventLogger):
@@ -105,7 +69,7 @@ class UserOrganizationEventLogger(EventLogger):
 
 
 class ResourceEventLogger(EventLogger):
-    resource = models.Resource
+    resource = models.ResourceMixin
 
     class Meta:
         event_types = (
@@ -132,37 +96,14 @@ class ResourceEventLogger(EventLogger):
             'resource_deletion_succeeded',
             'resource_deletion_failed',
         )
-
-
-class ServiceSettingsEventLogger(EventLogger):
-    service_settings = models.ServiceSettings
-    error_message = six.text_type
-
-    class Meta:
-        event_types = ('service_settings_sync_failed',
-                       'service_settings_recovered')
-
-
-class ServiceProjectLinkEventLogger(EventLogger):
-    service_project_link = models.ServiceProjectLink
-    error_message = six.text_type
-
-    class Meta:
-        event_types = ('service_project_link_creation_failed',
-                       'service_project_link_sync_failed',
-                       'service_project_link_recovered')
+        event_groups = {
+            'resources': event_types,
+        }
 
 
 event_logger.register('customer_role', CustomerRoleEventLogger)
 event_logger.register('project_role', ProjectRoleEventLogger)
-event_logger.register('project_group_role', ProjectGroupRoleEventLogger)
-event_logger.register('project_group_membership', ProjectGroupMembershipEventLogger)
 event_logger.register('user_organization', UserOrganizationEventLogger)
 event_logger.register('customer', CustomerEventLogger)
 event_logger.register('project', ProjectEventLogger)
-event_logger.register('project_group', ProjectGroupEventLogger)
-event_logger.register('licenses', LicensesEventLogger)
-event_logger.register('balance', BalanceEventLogger)
 event_logger.register('resource', ResourceEventLogger)
-event_logger.register('service_settings', ServiceSettingsEventLogger)
-event_logger.register('service_project_link', ServiceProjectLinkEventLogger)

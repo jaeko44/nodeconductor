@@ -1,5 +1,5 @@
 from admin_tools.menu import items, Menu
-from django.core.urlresolvers import reverse
+from django.urls import reverse
 from django.utils.text import capfirst
 from django.utils.translation import ugettext_lazy as _
 
@@ -37,20 +37,78 @@ class CustomMenu(Menu):
     """
     Custom Menu for admin site.
     """
+
+    IAAS_CLOUDS = (
+        'nodeconductor_assembly_waldur.packages.*',
+        'nodeconductor_azure.*',
+        'nodeconductor_openstack.*',
+        'nodeconductor_aws.*',
+        'nodeconductor_digitalocean.*',
+        'waldur_slurm.*',
+        'nodeconductor_assembly_waldur.slurm_invoices.*',
+    )
+
+    USERS = (
+        'nodeconductor.core.models.*',
+    )
+
+    ACCOUNTING = (
+        'nodeconductor_assembly_waldur.invoices.*',
+        'nodeconductor.cost_tracking.*',
+    )
+
+    APPLICATION_PROVIDERS = (
+        'waldur_ansible.*',
+    )
+
+    SUPPORT_MODULES = (
+        'nodeconductor_assembly_waldur.support.*',
+    )
+
     def __init__(self, **kwargs):
         Menu.__init__(self, **kwargs)
         self.children += [
             items.MenuItem(_('Dashboard'), reverse('admin:index')),
-            items.Bookmarks(),
-            CustomAppList(
-                _('Applications'),
-                exclude=('django.core.*',
-                         'rest_framework.authtoken.*',
-                         'nodeconductor.core.*',
-                         )
+            items.ModelList(
+                _('Users'),
+                models=self.USERS
             ),
             items.ModelList(
-                _('User management'),
-                models=('nodeconductor.core.*',)
+                _('Structure'),
+                models=(
+                    'nodeconductor.structure.*',
+                )
             ),
+            CustomAppList(
+                _('Accounting'),
+                models=self.ACCOUNTING,
+            ),
+
+            CustomAppList(
+                _('Providers'),
+                models=self.IAAS_CLOUDS,
+            ),
+            CustomAppList(
+                _('Applications'),
+                models=self.APPLICATION_PROVIDERS,
+            ),
+            CustomAppList(
+                _('Support'),
+                models=self.SUPPORT_MODULES,
+            ),
+            CustomAppList(
+                _('Utilities'),
+                exclude=('django.core.*',
+                         'django_openid_auth.*',
+                         'rest_framework.authtoken.*',
+                         'nodeconductor.core.*',
+                         'nodeconductor.structure.*',
+                         )
+                        + self.IAAS_CLOUDS
+                        + self.APPLICATION_PROVIDERS
+                        + self.SUPPORT_MODULES
+                        + self.ACCOUNTING
+                        + self.USERS
+            ),
+
         ]

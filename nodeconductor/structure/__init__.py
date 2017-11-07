@@ -1,10 +1,15 @@
-import collections
+from __future__ import unicode_literals
+
+import functools
 import importlib
+import logging
 
 from django.conf import settings
 from django.utils.lru_cache import lru_cache
 from django.utils.encoding import force_text
 from rest_framework.reverse import reverse
+
+logger = logging.getLogger(__name__)
 
 
 default_app_config = 'nodeconductor.structure.apps.StructureConfig'
@@ -19,7 +24,7 @@ class SupportedServices(object):
             'gitlab': {
                 'name': 'GitLab',
                 'model_name': 'gitlab.gitlabservice',
-                'backend': nodeconductor_plus.gitlab.backend.GitLabBackend,
+                'backend': nodeconductor_gitlab.backend.GitLabBackend,
                 'detail_view': 'gitlab-detail',
                 'list_view': 'gitlab-list',
                 'properties': {},
@@ -40,35 +45,34 @@ class SupportedServices(object):
 
     """
 
-    class Types(object):
-        OpenStack = 'OpenStack'
-        IaaS = 'IaaS'
+    @classmethod
+    def get_filter_mapping(cls):
+        return {name: code for code, name in cls.get_choices()}
 
-        @classmethod
-        def get_direct_filter_mapping(cls):
-            return tuple((name, name) for _, name in SupportedServices.get_choices())
-
-        @classmethod
-        def get_reverse_filter_mapping(cls):
-            return {name: code for code, name in SupportedServices.get_choices()}
-
-    _registry = collections.defaultdict(lambda: {
-        'backend': None,
-        'resources': {},
-        'properties': {}
-    })
+    _registry = {}
 
     @classmethod
-    def register_backend(cls, backend_class):
+    def _setdefault(cls, service_key):
+        cls._registry.setdefault(service_key, {
+            'resources': {},
+            'properties': {}
+        })
+
+    @classmethod
+    def register_backend(cls, backend_class, nested=False):
         if not cls._is_active_model(backend_class):
             return
 
-        key = cls.get_model_key(backend_class)
-        cls._registry[key]['backend'] = backend_class
+        # For nested backends just discover resources/properties
+        if not nested:
+            key = cls.get_model_key(backend_class)
+            cls._setdefault(key)
+            cls._registry[key]['backend'] = backend_class
 
+        # Forcely import service serialize to run services autodiscovery
         try:
-            # Forcely import service serialize to run services autodiscovery
-            importlib.import_module(backend_class.__module__.replace('backend', 'serializers'))
+            module_name = backend_class.__module__
+            importlib.import_module(module_name.replace('backend', 'serializers'))
         except ImportError:
             pass
 
@@ -77,28 +81,66 @@ class SupportedServices(object):
         if model is NotImplemented or not cls._is_active_model(model):
             return
         key = cls.get_model_key(model)
+        cls._setdefault(key)
         cls._registry[key]['name'] = key
         cls._registry[key]['model_name'] = cls._get_model_str(model)
         cls._registry[key]['detail_view'] = cls.get_detail_view_for_model(model)
         cls._registry[key]['list_view'] = cls.get_list_view_for_model(model)
 
     @classmethod
-    def register_resource(cls, model):
+    def register_service_serializer(cls, model, serializer):
         if model is NotImplemented or not cls._is_active_model(model):
             return
         key = cls.get_model_key(model)
+        cls._setdefault(key)
+        cls._registry[key]['serializer'] = serializer
+
+    @classmethod
+    def register_service_filter(cls, model, filter):
+        if model is NotImplemented or not cls._is_active_model(model):
+            return
+        key = cls.get_model_key(model)
+        cls._setdefault(key)
+        cls._registry[key]['filter'] = filter
+
+    @classmethod
+    def register_resource_serializer(cls, model, serializer):
+        if model is NotImplemented or not cls._is_active_model(model):
+            return
+        key = cls.get_model_key(model)
+        cls._setdefault(key)
         model_str = cls._get_model_str(model)
-        cls._registry[key]['resources'][model_str] = {
-            'name': model.__name__,
-            'detail_view': cls.get_detail_view_for_model(model),
-            'list_view': cls.get_list_view_for_model(model)
-        }
+        cls._registry[key]['resources'].setdefault(model_str, {'name': model.__name__})
+        cls._registry[key]['resources'][model_str]['detail_view'] = cls.get_detail_view_for_model(model)
+        cls._registry[key]['resources'][model_str]['list_view'] = cls.get_list_view_for_model(model)
+        cls._registry[key]['resources'][model_str]['serializer'] = serializer
+
+    @classmethod
+    def register_resource_filter(cls, model, filter):
+        if model is NotImplemented or not cls._is_active_model(model) or model._meta.abstract:
+            return
+        key = cls.get_model_key(model)
+        cls._setdefault(key)
+        model_str = cls._get_model_str(model)
+        cls._registry[key]['resources'].setdefault(model_str, {'name': model.__name__})
+        cls._registry[key]['resources'][model_str]['filter'] = filter
+
+    @classmethod
+    def register_resource_view(cls, model, view):
+        if model is NotImplemented or not cls._is_active_model(model) or model._meta.abstract:
+            return
+        key = cls.get_model_key(model)
+        cls._setdefault(key)
+        model_str = cls._get_model_str(model)
+        cls._registry[key]['resources'].setdefault(model_str, {'name': model.__name__})
+        cls._registry[key]['resources'][model_str]['view'] = view
 
     @classmethod
     def register_property(cls, model):
         if model is NotImplemented or not cls._is_active_model(model):
             return
         key = cls.get_model_key(model)
+        cls._setdefault(key)
         model_str = cls._get_model_str(model)
         cls._registry[key]['properties'][model_str] = {
             'name': model.__name__,
@@ -107,9 +149,11 @@ class SupportedServices(object):
 
     @classmethod
     def get_service_backend(cls, key):
+        if not isinstance(key, basestring):
+            key = cls.get_model_key(key)
         try:
             return cls._registry[key]['backend']
-        except IndexError:
+        except KeyError:
             raise ServiceBackendNotImplemented
 
     @classmethod
@@ -126,10 +170,19 @@ class SupportedServices(object):
                 for service in cls._registry.values()}
 
     @classmethod
+    def get_service_serializer(cls, model):
+        key = cls.get_model_key(model)
+        return cls._registry[key]['serializer']
+
+    @classmethod
+    def get_service_filter(cls, model):
+        key = cls.get_model_key(model)
+        return cls._registry[key]['filter']
+
+    @classmethod
     def get_resources(cls, request=None):
         """ Get a list of resources endpoints.
             {
-                "IaaS.Instance": "/api/iaas-resources/",
                 "DigitalOcean.Droplet": "/api/digitalocean-droplets/",
                 "Oracle.Database": "/api/oracle-databases/",
                 "GitLab.Group": "/api/gitlab-groups/",
@@ -139,6 +192,24 @@ class SupportedServices(object):
         return {'.'.join([service['name'], resource['name']]): reverse(resource['list_view'], request=request)
                 for service in cls._registry.values()
                 for resource in service['resources'].values()}
+
+    @classmethod
+    def get_resource_serializer(cls, model):
+        key = cls.get_model_key(model)
+        model_str = cls._get_model_str(model)
+        return cls._registry[key]['resources'][model_str]['serializer']
+
+    @classmethod
+    def get_resource_filter(cls, model):
+        key = cls.get_model_key(model)
+        model_str = cls._get_model_str(model)
+        return cls._registry[key]['resources'][model_str]['filter']
+
+    @classmethod
+    def get_resource_view(cls, model):
+        key = cls.get_model_key(model)
+        model_str = cls._get_model_str(model)
+        return cls._registry[key]['resources'][model_str]['view']
 
     @classmethod
     def get_services_with_resources(cls, request=None):
@@ -161,7 +232,7 @@ class SupportedServices(object):
         data = {}
         for service in cls._registry.values():
             service_model = apps.get_model(service['model_name'])
-            service_project_link = cls.get_service_project_link(service_model)
+            service_project_link = service_model.projects.through
             service_project_link_url = reverse(cls.get_list_view_for_model(service_project_link), request=request)
 
             data[service['name']] = {
@@ -170,7 +241,8 @@ class SupportedServices(object):
                 'resources': {resource['name']: reverse(resource['list_view'], request=request)
                               for resource in service['resources'].values()},
                 'properties': {resource['name']: reverse(resource['list_view'], request=request)
-                               for resource in service.get('properties', {}).values()}
+                               for resource in service.get('properties', {}).values()},
+                'is_public_service': cls.is_public_service(service_model)
             }
         return data
 
@@ -181,11 +253,11 @@ class SupportedServices(object):
             {
                 ...
                 'gitlab': {
-                    "service": nodeconductor_plus.gitlab.models.GitLabService,
-                    "service_project_link": nodeconductor_plus.gitlab.models.GitLabServiceProjectLink,
+                    "service": nodeconductor_gitlab.models.GitLabService,
+                    "service_project_link": nodeconductor_gitlab.models.GitLabServiceProjectLink,
                     "resources": [
-                        nodeconductor_plus.gitlab.models.Group,
-                        nodeconductor_plus.gitlab.models.Project
+                        nodeconductor_gitlab.models.Group,
+                        nodeconductor_gitlab.models.Project
                     ],
                 },
                 ...
@@ -197,7 +269,7 @@ class SupportedServices(object):
         data = {}
         for key, service in cls._registry.items():
             service_model = apps.get_model(service['model_name'])
-            service_project_link = cls.get_service_project_link(service_model)
+            service_project_link = service_model.projects.through
             data[key] = {
                 'service': service_model,
                 'service_project_link': service_project_link,
@@ -208,21 +280,14 @@ class SupportedServices(object):
         return data
 
     @classmethod
-    def get_service_project_link(cls, service_model):
-        return next(m[0].model for m in service_model._meta.get_all_related_objects_with_model()
-                    if m[0].var_name == 'cloudprojectmembership' or
-                    m[0].var_name.endswith('serviceprojectlink'))
-
-    @classmethod
     @lru_cache(maxsize=1)
     def get_resource_models(cls):
         """ Get a list of resource models.
             {
                 'DigitalOcean.Droplet': nodeconductor_plus.digitalocean.models.Droplet,
-                'GitLab.Group': nodeconductor_plus.gitlab.models.Group,
-                'GitLab.Project': nodeconductor_plus.gitlab.models.Project,
-                'IaaS.Instance': nodeconductor.iaas.models.Instance,
-                'Oracle.Database': nodeconductor.oracle.models.Database
+                'GitLab.Group': nodeconductor_gitlab.models.Group,
+                'GitLab.Project': nodeconductor_gitlab.models.Project,
+                'Oracle.Database': nodeconductor_oracle_dbaas.models.Database
             }
 
         """
@@ -233,12 +298,19 @@ class SupportedServices(object):
                 for resource, attrs in service['resources'].items()}
 
     @classmethod
-    @lru_cache(maxsize=1)
+    @lru_cache(maxsize=20)
     def get_service_resources(cls, model):
+        """ Get resource models by service model """
+        key = cls.get_model_key(model)
+        return cls.get_service_name_resources(key)
+
+    @classmethod
+    @lru_cache(maxsize=20)
+    def get_service_name_resources(cls, service_name):
+        """ Get resource models by service name """
         from django.apps import apps
 
-        key = cls.get_model_key(model)
-        resources = cls._registry[key]['resources'].keys()
+        resources = cls._registry[service_name]['resources'].keys()
         return [apps.get_model(resource) for resource in resources]
 
     @classmethod
@@ -261,15 +333,21 @@ class SupportedServices(object):
 
             >> SupportedServices.get_related_models(gitlab_models.Project)
             {
-                'service': nodeconductor_plus.gitlab.models.GitLabService,
-                'service_project_link': nodeconductor_plus.gitlab.models.GitLabServiceProjectLink,
+                'service': nodeconductor_gitlab.models.GitLabService,
+                'service_project_link': nodeconductor_gitlab.models.GitLabServiceProjectLink,
                 'resources': [
-                    nodeconductor_plus.gitlab.models.Group,
-                    nodeconductor_plus.gitlab.models.Project,
+                    nodeconductor_gitlab.models.Group,
+                    nodeconductor_gitlab.models.Project,
                 ]
             }
         """
-        model_str = cls._get_model_str(model)
+        from nodeconductor.structure.models import ServiceSettings
+
+        if isinstance(model, ServiceSettings):
+            model_str = cls._registry.get(model.type, {}).get('model_name', '')
+        else:
+            model_str = cls._get_model_str(model)
+
         for models in cls.get_service_models().values():
             if model_str == cls._get_model_str(models['service']) or \
                model_str == cls._get_model_str(models['service_project_link']):
@@ -282,7 +360,7 @@ class SupportedServices(object):
     @classmethod
     def _is_active_model(cls, model):
         """ Check is model app name is in list of INSTALLED_APPS """
-        # We need to use such tricky way to check because of inconsistence apps names:
+        # We need to use such tricky way to check because of inconsistent apps names:
         # some apps are included in format "<module_name>.<app_name>" like "nodeconductor.openstack"
         # other apps are included in format "<app_name>" like "nodecondcutor_sugarcrm"
         return ('.'.join(model.__module__.split('.')[:2]) in settings.INSTALLED_APPS or
@@ -294,8 +372,16 @@ class SupportedServices(object):
 
     @classmethod
     def get_model_key(cls, model):
+        return cls.get_app_config(model).service_name
+
+    @classmethod
+    def is_public_service(cls, model):
+        return getattr(cls.get_app_config(model), 'is_public_service', False)
+
+    @classmethod
+    def get_app_config(cls, model):
         from django.apps import apps
-        return apps.get_containing_app_config(model.__module__).service_name
+        return apps.get_containing_app_config(model.__module__)
 
     @classmethod
     def get_list_view_for_model(cls, model):
@@ -328,6 +414,25 @@ class ServiceBackendError(Exception):
     pass
 
 
+def log_backend_action(action=None):
+    """ Logging for backend method.
+
+    Expects django model instance as first argument.
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapped(self, instance, *args, **kwargs):
+            action_name = func.func_name.replace('_', ' ') if action is None else action
+
+            logger.debug('About to %s `%s` (PK: %s).', action_name, instance, instance.pk)
+            result = func(self, instance, *args, **kwargs)
+            logger.debug('Action `%s` was executed successfully for `%s` (PK: %s).',
+                         action_name, instance, instance.pk)
+            return result
+        return wrapped
+    return decorator
+
+
 class ServiceBackendNotImplemented(NotImplementedError):
     pass
 
@@ -335,10 +440,12 @@ class ServiceBackendNotImplemented(NotImplementedError):
 class ServiceBackend(object):
     """ Basic service backed with only common methods pre-defined. """
 
+    DEFAULTS = {}
+
     def __init__(self, settings, **kwargs):
         pass
 
-    def ping(self):
+    def ping(self, raise_exception=False):
         raise ServiceBackendNotImplemented
 
     def ping_resource(self, resource):
@@ -347,11 +454,8 @@ class ServiceBackend(object):
     def sync(self):
         raise ServiceBackendNotImplemented
 
-    def sync_link(self, service_project_link, is_initial=False):
-        raise ServiceBackendNotImplemented
-
-    def remove_link(self, service_project_link):
-        raise ServiceBackendNotImplemented
+    def has_global_properties(self):
+        return False
 
     def provision(self, resource, *args, **kwargs):
         raise ServiceBackendNotImplemented
@@ -368,18 +472,6 @@ class ServiceBackend(object):
     def restart(self, resource):
         raise ServiceBackendNotImplemented
 
-    def add_ssh_key(self, ssh_key, service_project_link):
-        raise ServiceBackendNotImplemented
-
-    def remove_ssh_key(self, ssh_key, service_project_link):
-        raise ServiceBackendNotImplemented
-
-    def add_user(self, user, service_project_link):
-        raise ServiceBackendNotImplemented
-
-    def remove_user(self, user, service_project_link):
-        raise ServiceBackendNotImplemented
-
     def get_resources_for_import(self):
         raise ServiceBackendNotImplemented
 
@@ -387,6 +479,9 @@ class ServiceBackend(object):
         raise ServiceBackendNotImplemented
 
     def get_monthly_cost_estimate(self, resource):
+        raise ServiceBackendNotImplemented
+
+    def get_stats(self):
         raise ServiceBackendNotImplemented
 
     @staticmethod

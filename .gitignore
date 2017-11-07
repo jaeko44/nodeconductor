@@ -4,8 +4,10 @@
 *.egg
 *.egg-info
 *.pyc
+*.mo
 db.sqlite3
 celerybeat-schedule
+dump.rdb
 
 /.idea
 /.project
@@ -25,5 +27,6 @@ TEST-*.xml
 
 # documentation
 docs/_build/
+docs/drfapi/
 
 /static_files

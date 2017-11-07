@@ -1,0 +1,3 @@
+[bandit]
+exclude: tests,venv,test_settings.py
+skips: B101

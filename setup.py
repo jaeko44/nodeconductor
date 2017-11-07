@@ -1,98 +1,79 @@
 #!/usr/bin/env python
-import sys
 from setuptools import setup, find_packages
 
+from nodeconductor.core.test_runner import Test
 
 dev_requires = [
     'Sphinx==1.2.2',
 ]
 
 tests_requires = [
-    'ddt>=1.0.0',
+    'ddt>=1.0.0,<1.1.0',
     'factory_boy==2.4.1',
-    'mock==1.0.1',
-    'mock-django==0.6.6',
+    'freezegun==0.3.7',
+    'mock>=1.0.1',
+    'mock-django==0.6.9',
     'six>=1.9.0',
-    'django-celery==3.1.16',
+    'sqlalchemy>=1.0.12',
 ]
 
 install_requires = [
-    'Celery>=3.1.15,<3.2',
+    'Celery>=3.1.23,<3.2',
     'croniter>=0.3.4,<0.3.6',
-    'Django>=1.7.1,<1.8',
-    'django-admin-tools==0.7.0',
-    'django-filter==0.10',
-    'django-fluent-dashboard==0.5.1',
-    'django-fsm==2.2.0',
-    'django-model-utils==2.2',
-    'django-permission==0.8.2',
-    'django-polymorphic>=0.7',
-    'django-reversion>=1.8.7,<=1.9.3',
-    'django-taggit>=0.17.5',
-    'django-uuidfield==0.5.0',
-    'djangorestframework>=3.1.0,<3.2.0',
-    'elasticsearch>=1.0.0,<2.0.0',
+    'Django>=1.11,<2.0',
+    'django-admin-tools==0.8.0',
+    'django-filter==1.0.2',
+    'django-fluent-dashboard==0.6.1',
+    'django-fsm==2.3.0',
+    'django-jsoneditor>=0.0.7',
+    'django-model-utils==3.0.0',
+    'django-redis-cache>=1.6.5',
+    'django-reversion==2.0.8',
+    'django-rest-swagger==2.1.2',
+    'django-taggit>=0.20.2',
+    'djangorestframework>=3.6.3,<3.7.0',
+    'elasticsearch==5.4.0',
+    'hiredis>=0.2.0',
     'iptools>=0.6.1',
-    'jira>=0.47',
-    'jsonfield==1.0.0',
-    'Pillow>=2.0.0,<3.0.0',
-    'python-ceilometerclient==1.0.12',
-    'python-cinderclient==1.1.1',
-    'python-glanceclient==0.15.0',
-    'python-keystoneclient==0.11.1',
-    'python-neutronclient==2.3.9',
-    'python-novaclient==2.20.0',
+    'PrettyTable<0.8,>=0.7.1',
+    'Pillow>=2.0.0',
+    'psycopg2>=2.5.4',  # https://docs.djangoproject.com/en/1.11/ref/databases/#postgresql-notes
     'PyYAML>=3.10',
-    'pyzabbix>=0.7.2',
+    'pycountry>=1.20,<2.0',
+    'pyvat>=1.3.1,<2.0',
     'redis==2.10.3',
-    'requests>=2.6.0',
+    'requests>=2.6.0,!=2.12.2,!=2.13.0',
     'sqlparse>=0.1.11',
 ]
 
-
-# RPM installation does not need oslo, cliff and stevedore libs -
-# they are required only for installation with setuptools
-try:
-    action = sys.argv[1]
-except IndexError:
-    pass
-else:
-    if action in ['develop', 'install', 'test']:
-        install_requires += [
-            'cliff==1.7.0',
-            'oslo.config==1.4.0',
-            'oslo.i18n==1.0.0',
-            'oslo.utils==1.0.0',
-            'stevedore==1.0.0',
-        ]
-
-
 setup(
     name='nodeconductor',
-    version='0.84.0',
+    version='0.149.3',
     author='OpenNode Team',
     author_email='info@opennodecloud.com',
-    url='https://github.com/opennode/nodeconductor',
-    description='NodeConductor is REST server for infrastructure management.',
+    url='https://github.com/opennode/waldur-core',
+    description='Waldur core is a core of Waldur cloud management service.',
     long_description=open('README.rst').read(),
-    packages=find_packages(exclude=["*.tests", "*.tests.*", "tests.*", "tests"]),
+    packages=find_packages(),
     install_requires=install_requires,
     extras_require={
         'dev': dev_requires,
         'tests': tests_requires,
     },
     entry_points={
-        'backup_strategies': ('Instance = nodeconductor.iaas.backup.instance_backup:InstanceBackupStrategy',),
-        'console_scripts': ('nodeconductor = nodeconductor.server.manage:main',),
+        'console_scripts': (
+            'nodeconductor = nodeconductor.server.manage:main',
+            'waldur = nodeconductor.server.manage:main',
+        ),
     },
     tests_require=tests_requires,
-    test_suite='nodeconductor.server.test_runner.run_tests',
+    cmdclass={'test': Test},
     include_package_data=True,
     classifiers=[
         'Framework :: Django',
         'Intended Audience :: Developers',
         'Intended Audience :: System Administrators',
-        'License :: OSI Approved :: Apache Software License',
+        'License :: OSI Approved :: MIT License',
         'Operating System :: OS Independent',
     ],
 )

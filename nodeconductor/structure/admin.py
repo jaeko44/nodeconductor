@@ -1,15 +1,59 @@
+import json
+
+from django.conf import settings
+from django.conf.urls import url
 from django.contrib import admin, messages
 from django.contrib.admin import SimpleListFilter
 from django.contrib.admin.widgets import FilteredSelectMultiple
+from django.core.exceptions import ValidationError
 from django.db import models as django_models
-from django.forms import ModelForm, ModelMultipleChoiceField, ChoiceField
+from django.forms import ModelMultipleChoiceField, ModelForm, RadioSelect, ChoiceField, CharField
 from django.http import HttpResponseRedirect
+from django.shortcuts import render
+from django.utils import six
+from django.utils.translation import ugettext_lazy as _
 from django.utils.translation import ungettext
+from jsoneditor.forms import JSONEditor
 
-from nodeconductor.core.models import SynchronizationStates, User
+from nodeconductor.core import utils as core_utils
+from nodeconductor.core.admin import get_admin_url, ExecutorAdminAction, PasswordWidget
+from nodeconductor.core.models import User
 from nodeconductor.core.tasks import send_task
+from nodeconductor.core.validators import BackendURLValidator
 from nodeconductor.quotas.admin import QuotaInline
-from nodeconductor.structure import models, SupportedServices
+from nodeconductor.structure import models, SupportedServices, executors, utils
+
+
+class BackendModelAdmin(admin.ModelAdmin):
+
+    def has_add_permission(self, request):
+        return False
+
+    def get_readonly_fields(self, request, obj=None):
+        fields = super(BackendModelAdmin, self).get_readonly_fields(request, obj)
+
+        if not obj:
+            return fields
+
+        excluded = self.get_exclude(request, obj) or tuple()
+        if not settings.NODECONDUCTOR['BACKEND_FIELDS_EDITABLE']:
+            instance_class = type(obj)
+            fields = fields + instance_class.get_backend_fields()
+            fields = filter(lambda field: field not in excluded, fields)
+
+        return fields
+
+
+class FormRequestAdminMixin(object):
+    """
+    This mixin allows you to get current request user in the model admin form,
+    which then passed to add_user method, so that user which granted role,
+    is stored in the permission model.
+    """
+    def get_form(self, request, obj=None, **kwargs):
+        form = super(FormRequestAdminMixin, self).get_form(request, obj=obj, **kwargs)
+        form.request = request
+        return form
 
 
 class ChangeReadonlyMixin(object):
@@ -40,18 +84,46 @@ class ProtectedModelMixin(object):
             return response
 
 
+class ResourceCounterFormMixin(object):
+
+    def get_vm_count(self, obj):
+        return obj.quotas.get(name=obj.Quotas.nc_vm_count).usage
+
+    get_vm_count.short_description = _('VM count')
+
+    def get_app_count(self, obj):
+        return obj.quotas.get(name=obj.Quotas.nc_app_count).usage
+
+    get_app_count.short_description = _('Application count')
+
+    def get_private_cloud_count(self, obj):
+        return obj.quotas.get(name=obj.Quotas.nc_private_cloud_count).usage
+
+    get_private_cloud_count.short_description = _('Private cloud count')
+
+
 class CustomerAdminForm(ModelForm):
     owners = ModelMultipleChoiceField(User.objects.all().order_by('full_name'), required=False,
-                                      widget=FilteredSelectMultiple(verbose_name='Owners', is_stacked=False))
+                                      widget=FilteredSelectMultiple(verbose_name=_('Owners'), is_stacked=False))
+    support_users = ModelMultipleChoiceField(User.objects.all().order_by('full_name'), required=False,
+                                             widget=FilteredSelectMultiple(verbose_name=_('Support users'),
+                                                                           is_stacked=False))
 
     def __init__(self, *args, **kwargs):
         super(CustomerAdminForm, self).__init__(*args, **kwargs)
         if self.instance and self.instance.pk:
-            self.owners = self.instance.roles.get(
-                role_type=models.CustomerRole.OWNER).permission_group.user_set.all()
+            self.owners = self.instance.get_owners()
+            self.support_users = self.instance.get_support_users()
             self.fields['owners'].initial = self.owners
+            self.fields['support_users'].initial = self.support_users
         else:
             self.owners = User.objects.none()
+            self.support_users = User.objects.none()
+        self.fields['agreement_number'].initial = models.get_next_agreement_number()
+
+        textarea_attrs = {'cols': '40', 'rows': '4'}
+        self.fields['contact_details'].widget.attrs = textarea_attrs
+        self.fields['access_subnets'].widget.attrs = textarea_attrs
 
     def save(self, commit=True):
         customer = super(CustomerAdminForm, self).save(commit=False)
@@ -59,78 +131,75 @@ class CustomerAdminForm(ModelForm):
         if not customer.pk:
             customer.save()
 
-        new_owners = self.cleaned_data['owners']
-        added_owners = new_owners.exclude(pk__in=self.owners)
-        removed_owners = self.owners.exclude(pk__in=new_owners)
-        for user in added_owners:
-            customer.add_user(user, role_type=models.CustomerRole.OWNER)
-
-        for user in removed_owners:
-            customer.remove_user(user, role_type=models.CustomerRole.OWNER)
-
-        self.save_m2m()
+        self.populate_users('owners', customer, models.CustomerRole.OWNER)
+        self.populate_users('support_users', customer, models.CustomerRole.SUPPORT)
 
         return customer
 
+    def populate_users(self, field_name, customer, role):
+        field = getattr(self, field_name)
+        new_users = self.cleaned_data[field_name]
 
-class CustomerAdmin(ProtectedModelMixin, admin.ModelAdmin):
+        removed_users = field.exclude(pk__in=new_users)
+        for user in removed_users:
+            customer.remove_user(user, role)
+
+        added_users = new_users.exclude(pk__in=field)
+        for user in added_users:
+            # User role within customer must be unique.
+            if not customer.has_user(user):
+                customer.add_user(user, role, self.request.user)
+
+        self.save_m2m()
+
+
+class BillingMixin(object):
+    def get_accounting_start_date(self, customer):
+        if not hasattr(customer, 'payment_details'):
+            return None
+        return customer.payment_details.accounting_start_date
+
+    get_accounting_start_date.short_description = _('Start day of accounting')
+
+
+class CustomerAdmin(FormRequestAdminMixin,
+                    ResourceCounterFormMixin,
+                    BillingMixin,
+                    ProtectedModelMixin,
+                    admin.ModelAdmin):
     form = CustomerAdminForm
-    fields = ('name', 'image', 'native_name', 'abbreviation', 'contact_details', 'registration_code',
-              'billing_backend_id', 'balance', 'owners')
-    readonly_fields = ['balance']
-    actions = ['update_projected_estimate']
-    list_display = ['name', 'billing_backend_id', 'uuid', 'abbreviation', 'created']
+    fields = ('name', 'uuid', 'image', 'native_name', 'abbreviation', 'contact_details', 'registration_code',
+              'agreement_number', 'email', 'phone_number', 'access_subnets',
+              'country', 'vat_code', 'is_company', 'owners', 'support_users')
+    list_display = ['name', 'uuid', 'abbreviation',
+                    'created', 'get_accounting_start_date',
+                    'get_vm_count', 'get_app_count', 'get_private_cloud_count']
+    search_fields = ['name', 'uuid', 'abbreviation']
+    readonly_fields = ['uuid']
     inlines = [QuotaInline]
-
-    def update_projected_estimate(self, request, queryset):
-        customers_without_backend_id = []
-        succeeded_customers = []
-        for customer in queryset:
-            if not customer.billing_backend_id:
-                customers_without_backend_id.append(customer)
-                continue
-            send_task('cost_tracking', 'update_projected_estimate')(
-                customer_uuid=customer.uuid.hex)
-            succeeded_customers.append(customer)
-
-        if succeeded_customers:
-            message = ungettext(
-                'Projected estimate generation successfully scheduled for customer %(customers_names)s',
-                'Projected estimate generation successfully scheduled for customers: %(customers_names)s',
-                len(succeeded_customers)
-            )
-            message = message % {'customers_names': ', '.join([c.name for c in succeeded_customers])}
-            self.message_user(request, message)
-
-        if customers_without_backend_id:
-            message = ungettext(
-                'Cannot generate estimate for customer without backend id: %(customers_names)s',
-                'Cannot generate estimate for customers without backend id: %(customers_names)s',
-                len(customers_without_backend_id)
-            )
-            message = message % {'customers_names': ', '.join([c.name for c in customers_without_backend_id])}
-            self.message_user(request, message)
-
-    update_projected_estimate.short_description = "Update projected cost estimate"
 
 
 class ProjectAdminForm(ModelForm):
     admins = ModelMultipleChoiceField(User.objects.all().order_by('full_name'), required=False,
-                                      widget=FilteredSelectMultiple(verbose_name='Admins', is_stacked=False))
+                                      widget=FilteredSelectMultiple(verbose_name=_('Admins'), is_stacked=False))
     managers = ModelMultipleChoiceField(User.objects.all().order_by('full_name'), required=False,
-                                        widget=FilteredSelectMultiple(verbose_name='Managers', is_stacked=False))
+                                        widget=FilteredSelectMultiple(verbose_name=_('Managers'), is_stacked=False))
+    support_users = ModelMultipleChoiceField(User.objects.all().order_by('full_name'), required=False,
+                                             widget=FilteredSelectMultiple(verbose_name=_('Support users'),
+                                                                           is_stacked=False))
 
     def __init__(self, *args, **kwargs):
         super(ProjectAdminForm, self).__init__(*args, **kwargs)
         if self.instance and self.instance.pk:
-            self.admins = self.instance.roles.get(
-                role_type=models.ProjectRole.ADMINISTRATOR).permission_group.user_set.all()
-            self.managers = self.instance.roles.get(
-                role_type=models.ProjectRole.MANAGER).permission_group.user_set.all()
+            self.admins = self.instance.get_users(models.ProjectRole.ADMINISTRATOR)
+            self.managers = self.instance.get_users(models.ProjectRole.MANAGER)
+            self.support_users = self.instance.get_users(models.ProjectRole.SUPPORT)
             self.fields['admins'].initial = self.admins
             self.fields['managers'].initial = self.managers
+            self.fields['support_users'].initial = self.support_users
         else:
-            self.admins, self.managers = User.objects.none(), User.objects.none()
+            for field_name in ('admins', 'managers', 'support_users'):
+                setattr(self, field_name, User.objects.none())
 
     def save(self, commit=True):
         project = super(ProjectAdminForm, self).save(commit=False)
@@ -138,86 +207,71 @@ class ProjectAdminForm(ModelForm):
         if not project.pk:
             project.save()
 
-        new_admins = self.cleaned_data['admins']
-        added_admins = new_admins.exclude(pk__in=self.admins)
-        removed_admins = self.admins.exclude(pk__in=new_admins)
-        for user in added_admins:
-            project.add_user(user, role_type=models.ProjectRole.ADMINISTRATOR)
-
-        for user in removed_admins:
-            project.remove_user(user, role_type=models.ProjectRole.ADMINISTRATOR)
-
-        new_managers = self.cleaned_data['managers']
-        added_managers = new_managers.exclude(pk__in=self.managers)
-        removed_managers = self.managers.exclude(pk__in=new_managers)
-        for user in added_managers:
-            project.add_user(user, role_type=models.ProjectRole.MANAGER)
-
-        for user in removed_managers:
-            project.remove_user(user, role_type=models.ProjectRole.MANAGER)
-
-        self.save_m2m()
+        self.populate_users('admins', project, models.ProjectRole.ADMINISTRATOR)
+        self.populate_users('managers', project, models.ProjectRole.MANAGER)
+        self.populate_users('support_users', project, models.ProjectRole.SUPPORT)
 
         return project
 
+    def populate_users(self, field_name, project, role):
+        field = getattr(self, field_name)
+        new_users = self.cleaned_data[field_name]
 
-class ProjectAdmin(ProtectedModelMixin, ChangeReadonlyMixin, admin.ModelAdmin):
+        removed_users = field.exclude(pk__in=new_users)
+        for user in removed_users:
+            project.remove_user(user, role)
+
+        added_users = new_users.exclude(pk__in=field)
+        for user in added_users:
+            # User role within project must be unique.
+            if not project.has_user(user):
+                project.add_user(user, role, self.request.user)
+        self.save_m2m()
+
+
+class ProjectAdmin(FormRequestAdminMixin,
+                   ResourceCounterFormMixin,
+                   ProtectedModelMixin,
+                   ChangeReadonlyMixin,
+                   admin.ModelAdmin):
     form = ProjectAdminForm
 
-    fields = ('name', 'description', 'customer', 'admins', 'managers')
+    fields = ('name', 'description', 'customer', 'admins', 'managers', 'support_users', 'certifications')
 
-    list_display = ['name', 'uuid', 'customer', 'created']
+    list_display = ['name', 'uuid', 'customer', 'created', 'get_vm_count', 'get_app_count', 'get_private_cloud_count']
     search_fields = ['name', 'uuid']
     change_readonly_fields = ['customer']
     inlines = [QuotaInline]
+    filter_horizontal = ('certifications',)
+    actions = ('cleanup',)
+
+    class Cleanup(ExecutorAdminAction):
+        executor = executors.ProjectCleanupExecutor
+        short_description = _('Delete projects with all resources')
+
+    cleanup = Cleanup()
 
 
-class ProjectGroupAdminForm(ModelForm):
-    managers = ModelMultipleChoiceField(User.objects.all().order_by('full_name'), required=False,
-                                        widget=FilteredSelectMultiple(verbose_name='Managers', is_stacked=False))
-
-    def __init__(self, *args, **kwargs):
-        super(ProjectGroupAdminForm, self).__init__(*args, **kwargs)
-        if self.instance and self.instance.pk:
-            self.managers = self.instance.roles.get(
-                role_type=models.ProjectGroupRole.MANAGER).permission_group.user_set.all()
-            self.fields['managers'].initial = self.managers
-        else:
-            self.managers = User.objects.none()
-
-    def save(self, commit=True):
-        group = super(ProjectGroupAdminForm, self).save(commit=False)
-
-        if not group.pk:
-            group.save()
-
-        new_managers = self.cleaned_data['managers']
-        added_managers = new_managers.exclude(pk__in=self.managers)
-        removed_managers = self.managers.exclude(pk__in=new_managers)
-        for user in added_managers:
-            group.add_user(user, role_type=models.ProjectGroupRole.MANAGER)
-
-        for user in removed_managers:
-            group.remove_user(user, role_type=models.ProjectGroupRole.MANAGER)
-
-        self.save_m2m()
-
-        return group
-
-
-class ProjectGroupAdmin(ProtectedModelMixin, ChangeReadonlyMixin, admin.ModelAdmin):
-    form = ProjectGroupAdminForm
-    fields = ('name', 'description', 'customer', 'managers')
-
-    list_display = ['name', 'uuid', 'customer', 'created']
-    search_fields = ['name', 'uuid']
-    change_readonly_fields = ['customer']
+class ServiceCertificationAdmin(admin.ModelAdmin):
+    list_display = ('name', 'link')
+    search_fields = ['name', 'link']
+    list_filter = ('service_settings',)
 
 
 class ServiceSettingsAdminForm(ModelForm):
+    backend_url = CharField(max_length=200, required=False, validators=[BackendURLValidator()])
+
+    class Meta:
+        widgets = {
+            'options': JSONEditor(),
+            'geolocations': JSONEditor(),
+            'password': PasswordWidget(),
+        }
+
     def __init__(self, *args, **kwargs):
         super(ServiceSettingsAdminForm, self).__init__(*args, **kwargs)
-        self.fields['type'] = ChoiceField(choices=SupportedServices.get_choices())
+        self.fields['type'] = ChoiceField(choices=SupportedServices.get_choices(),
+                                          widget=RadioSelect)
 
 
 class ServiceTypeFilter(SimpleListFilter):
@@ -234,13 +288,25 @@ class ServiceTypeFilter(SimpleListFilter):
             return queryset
 
 
-class ServiceSettingsAdmin(ChangeReadonlyMixin, admin.ModelAdmin):
+class PrivateServiceSettingsAdmin(ChangeReadonlyMixin, admin.ModelAdmin):
     readonly_fields = ('error_message',)
-    list_display = ('name', 'customer', 'get_type_display', 'shared', 'state', 'error_message')
-    list_filter = (ServiceTypeFilter, 'state', 'shared')
-    change_readonly_fields = ('shared', 'customer')
-    actions = ['sync', 'recover']
+    list_display = ('name', 'customer', 'get_type_display', 'state', 'error_message')
+    list_filter = (ServiceTypeFilter, 'state')
+    change_readonly_fields = ('customer',)
+    actions = ['pull']
     form = ServiceSettingsAdminForm
+    fields = ('type', 'name', 'backend_url', 'username', 'password',
+              'token', 'domain', 'certificate', 'options', 'customer',
+              'state', 'error_message', 'tags', 'homepage', 'terms_of_services',
+              'certifications', 'geolocations')
+    inlines = [QuotaInline]
+    filter_horizontal = ('certifications',)
+    common_fields = ('type', 'name', 'options', 'customer',
+                     'state', 'error_message', 'tags', 'homepage', 'terms_of_services',
+                     'certifications', 'geolocations')
+
+    # must be specified explicitly not to be constructed from model name by default.
+    change_form_template = 'admin/structure/servicesettings/change_form.html'
 
     def get_type_display(self, obj):
         return obj.get_type_display()
@@ -248,137 +314,190 @@ class ServiceSettingsAdmin(ChangeReadonlyMixin, admin.ModelAdmin):
 
     def add_view(self, *args, **kwargs):
         self.exclude = getattr(self, 'add_exclude', ())
-        return super(ServiceSettingsAdmin, self).add_view(*args, **kwargs)
+        return super(PrivateServiceSettingsAdmin, self).add_view(*args, **kwargs)
+
+    def changeform_view(self, request, object_id=None, form_url='', extra_context=None):
+        extra_context = extra_context or {}
+        service_field_names = utils.get_all_services_field_names()
+        for service_name in service_field_names:
+            service_field_names[service_name].extend(self.common_fields)
+        extra_context['service_fields'] = json.dumps(service_field_names)
+        return super(PrivateServiceSettingsAdmin, self).changeform_view(request, object_id, form_url, extra_context)
 
     def get_readonly_fields(self, request, obj=None):
-        fields = super(ServiceSettingsAdmin, self).get_readonly_fields(request, obj)
-        if obj and not obj.shared:
-            if request.method == 'GET':
-                obj.password = '(hidden)'
-            return fields + ('password',)
+        fields = super(PrivateServiceSettingsAdmin, self).get_readonly_fields(request, obj)
+        if not obj:
+            return fields + ('state',)
         return fields
 
-    def get_form(self, request, obj=None, **kwargs):
-        # filter out certain fields from the creation form
-        if not obj:
-            kwargs['exclude'] = ('state',)
-        form = super(ServiceSettingsAdmin, self).get_form(request, obj, **kwargs)
-        if 'shared' in form.base_fields:
-            form.base_fields['shared'].initial = True
-        return form
+    def get_urls(self):
+        my_urls = [
+            url(r'^(.+)/change/services/$', self.admin_site.admin_view(self.services)),
+        ]
+        return my_urls + super(PrivateServiceSettingsAdmin, self).get_urls()
 
-    def sync(self, request, queryset):
-        queryset = queryset.filter(state=SynchronizationStates.IN_SYNC)
-        service_uuids = list(queryset.values_list('uuid', flat=True))
-        tasks_scheduled = queryset.count()
+    def services(self, request, pk=None):
+        settings = models.ServiceSettings.objects.get(id=pk)
+        projects = {}
 
-        send_task('structure', 'sync_service_settings')(service_uuids)
+        spl_model = SupportedServices.get_related_models(settings)['service_project_link']
+        for spl in spl_model.objects.filter(service__settings=settings):
+            projects.setdefault(spl.project.id, {
+                'name': six.text_type(spl.project),
+                'url': get_admin_url(spl.project),
+                'services': [],
+            })
+            projects[spl.project.id]['services'].append({
+                'name': six.text_type(spl.service),
+                'url': get_admin_url(spl.service),
+            })
 
-        message = ungettext(
-            'One service settings record scheduled for sync',
-            '%(tasks_scheduled)d service settings records scheduled for sync',
-            tasks_scheduled)
-        message = message % {'tasks_scheduled': tasks_scheduled}
+        return render(request, 'structure/service_settings_entities.html', {'projects': projects.values()})
 
-        self.message_user(request, message)
+    class Pull(ExecutorAdminAction):
+        executor = executors.ServiceSettingsPullExecutor
+        short_description = _('Pull')
 
-    sync.short_description = "Sync selected service settings with backend"
+        def validate(self, service_settings):
+            States = models.ServiceSettings.States
+            if service_settings.state not in (States.OK, States.ERRED):
+                raise ValidationError(_('Service settings has to be OK or erred.'))
 
-    def recover(self, request, queryset):
-        selected_settings = queryset.count()
-        queryset = queryset.filter(state=SynchronizationStates.ERRED)
-        service_uuids = list(queryset.values_list('uuid', flat=True))
-        send_task('structure', 'recover_service_settings')(service_uuids)
+    pull = Pull()
 
-        tasks_scheduled = queryset.count()
-        if selected_settings != tasks_scheduled:
-            message = 'Only erred service settings can be recovered'
-            self.message_user(request, message, level=messages.WARNING)
+    def save_model(self, request, obj, form, change):
+        obj.save()
+        if not change:
+            executors.ServiceSettingsCreateExecutor.execute(obj)
 
-        message = ungettext(
-            'One service settings record scheduled for recover',
-            '%(tasks_scheduled)d service settings records scheduled for recover',
-            tasks_scheduled)
-        message = message % {'tasks_scheduled': tasks_scheduled}
 
-        self.message_user(request, message)
+class SharedServiceSettingsAdmin(PrivateServiceSettingsAdmin):
+    actions = ['pull', 'connect_shared']
 
-    recover.short_description = "Recover selected service settings"
+    def get_fields(self, request, obj=None):
+        fields = super(SharedServiceSettingsAdmin, self).get_fields(request, obj)
+        return [field for field in fields if field != 'customer']
+
+    def get_list_display(self, request):
+        fields = super(SharedServiceSettingsAdmin, self).get_list_display(request)
+        return [field for field in fields if field != 'customer']
+
+    def save_form(self, request, form, change):
+        obj = super(SharedServiceSettingsAdmin, self).save_form(request, form, change)
+        if not change:
+            obj.shared = True
+        return obj
+
+    class ConnectShared(ExecutorAdminAction):
+        executor = executors.ServiceSettingsConnectSharedExecutor
+        short_description = _('Create SPLs and services for shared service settings')
+
+        def validate(self, service_settings):
+            if not service_settings.shared:
+                raise ValidationError(_('It is impossible to connect not shared settings.'))
+
+    connect_shared = ConnectShared()
 
 
 class ServiceAdmin(admin.ModelAdmin):
-    list_display = ('name', 'customer', 'settings')
-    ordering = ('name', 'customer')
+    list_display = ('settings', 'customer')
+    ordering = ('customer',)
 
 
 class ServiceProjectLinkAdmin(admin.ModelAdmin):
-    readonly_fields = ('service', 'project', 'error_message')
-    list_display = ('get_service_name', 'get_customer_name', 'get_project_name', 'state')
-    ordering = ('service__customer__name', 'project__name', 'service__name')
+    readonly_fields = ('service', 'project')
+    list_display = ('get_service_name', 'get_customer_name', 'get_project_name')
+    list_filter = ('service__settings', 'project__name', 'service__settings__name')
+    ordering = ('service__customer__name', 'project__name')
     list_display_links = ('get_service_name',)
-    search_fields = ('service__customer__name', 'project__name', 'service__name')
-
-    actions = ['sync_with_backend', 'recover_erred_service_project_links']
+    search_fields = ('service__customer__name', 'project__name', 'service__settings__name')
+    inlines = [QuotaInline]
 
     def get_queryset(self, request):
         queryset = super(ServiceProjectLinkAdmin, self).get_queryset(request)
         return queryset.select_related('service', 'project', 'project__customer')
 
-    def sync_with_backend(self, request, queryset):
-        queryset = queryset.filter(state=SynchronizationStates.IN_SYNC)
-        send_task('structure', 'sync_service_project_links')([spl.to_string() for spl in queryset])
-
-        tasks_scheduled = queryset.count()
-        message = ungettext(
-            'One service project link scheduled for update',
-            '%(tasks_scheduled)d service project links scheduled for update',
-            tasks_scheduled
-        )
-        message = message % {'tasks_scheduled': tasks_scheduled}
-
-        self.message_user(request, message)
-
-    sync_with_backend.short_description = "Sync selected service project links with backend"
-
-    def recover_erred_service_project_links(self, request, queryset):
-        queryset = queryset.filter(state=SynchronizationStates.ERRED)
-        send_task('structure', 'recover_erred_services')([spl.to_string() for spl in queryset])
-        tasks_scheduled = queryset.count()
-
-        message = ungettext(
-            'One service project link scheduled for recovery',
-            '%(tasks_scheduled)d service project links scheduled for recovery',
-            tasks_scheduled
-        )
-        message = message % {'tasks_scheduled': tasks_scheduled}
-
-        self.message_user(request, message)
-
-    recover_erred_service_project_links.short_description = "Recover selected service project links"
-
     def get_service_name(self, obj):
-        return obj.service.name
+        return obj.service.settings.name
 
-    get_service_name.short_description = 'Service'
+    get_service_name.short_description = _('Service')
 
     def get_project_name(self, obj):
         return obj.project.name
 
-    get_project_name.short_description = 'Project'
+    get_project_name.short_description = _('Project')
 
     def get_customer_name(self, obj):
         return obj.service.customer.name
 
-    get_customer_name.short_description = 'Customer'
+    get_customer_name.short_description = _('Customer')
 
 
-class ResourceAdmin(admin.ModelAdmin):
+class DerivedFromSharedSettingsResourceFilter(SimpleListFilter):
+    title = _('service settings')
+    parameter_name = 'shared__exact'
+
+    def lookups(self, request, model_admin):
+        return ((1, _('Shared')), (0, _('Private')))
+
+    def queryset(self, request, queryset):
+        if self.value() is not None:
+            return queryset.filter(service_project_link__service__settings__shared=self.value())
+        else:
+            return queryset
+
+
+class ResourceAdmin(BackendModelAdmin):
     readonly_fields = ('error_message',)
-    list_display = ('name', 'backend_id', 'state')
-    list_filter = ('state',)
+    list_display = ('uuid', 'name', 'backend_id', 'state', 'created',
+                    'get_service', 'get_project', 'error_message', 'get_settings_shared')
+    list_filter = ('state', DerivedFromSharedSettingsResourceFilter)
+
+    def get_settings_shared(self, obj):
+        return obj.service_project_link.service.settings.shared
+
+    get_settings_shared.short_description = _('Are service settings shared')
+
+    def get_service(self, obj):
+        return obj.service_project_link.service
+
+    get_service.short_description = _('Service')
+    get_service.admin_order_field = 'service_project_link__service__settings__name'
+
+    def get_project(self, obj):
+        return obj.service_project_link.project
+
+    get_project.short_description = _('Project')
+    get_project.admin_order_field = 'service_project_link__project__name'
 
 
+class PublishableResourceAdmin(ResourceAdmin):
+    list_display = ResourceAdmin.list_display + ('publishing_state',)
+
+
+class VirtualMachineAdmin(ResourceAdmin):
+    readonly_fields = ResourceAdmin.readonly_fields + ('image_name',)
+
+    actions = ['detect_coordinates']
+
+    def detect_coordinates(self, request, queryset):
+        send_task('structure', 'detect_vm_coordinates_batch')([core_utils.serialize_instance(vm) for vm in queryset])
+
+        tasks_scheduled = queryset.count()
+        message = ungettext(
+            'Coordinates detection has been scheduled for one virtual machine.',
+            'Coordinates detection has been scheduled for %(tasks_scheduled)d virtual machines.',
+            tasks_scheduled
+        )
+        message = message % {'tasks_scheduled': tasks_scheduled}
+
+        self.message_user(request, message)
+
+    detect_coordinates.short_description = _('Detect coordinates of virtual machines')
+
+
+admin.site.register(models.ServiceCertification, ServiceCertificationAdmin)
 admin.site.register(models.Customer, CustomerAdmin)
 admin.site.register(models.Project, ProjectAdmin)
-admin.site.register(models.ProjectGroup, ProjectGroupAdmin)
-admin.site.register(models.ServiceSettings, ServiceSettingsAdmin)
+admin.site.register(models.PrivateServiceSettings, PrivateServiceSettingsAdmin)
+admin.site.register(models.SharedServiceSettings, SharedServiceSettingsAdmin)

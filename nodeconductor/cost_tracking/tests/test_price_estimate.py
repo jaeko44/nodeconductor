@@ -1,38 +1,23 @@
 from ddt import ddt, data
-from rest_framework import test, status
+from django.utils import timezone
+from freezegun import freeze_time
+from rest_framework import status
 
-from nodeconductor.cost_tracking import models
-from nodeconductor.cost_tracking.tests import factories
-# dependency from openstack application exists only in tests
-from nodeconductor.openstack.tests import factories as openstack_factories
-from nodeconductor.structure import models as structure_models
+from nodeconductor.core.tests.helpers import override_nodeconductor_settings
 from nodeconductor.structure.tests import factories as structure_factories
+
+from .. import models
+from . import factories
+from .base_test import BaseCostTrackingTest
 
 
 @ddt
-class PriceEstimateListTest(test.APITransactionTestCase):
-
+class PriceEstimateListTest(BaseCostTrackingTest):
     def setUp(self):
-        self.users = {
-            'staff': structure_factories.UserFactory(username='staff', is_staff=True),
-            'owner': structure_factories.UserFactory(username='owner'),
-            'administrator': structure_factories.UserFactory(username='administrator'),
-            'manager': structure_factories.UserFactory(username='manager'),
-        }
-
-        self.customer = structure_factories.CustomerFactory()
-        self.customer.add_user(self.users['owner'], structure_models.CustomerRole.OWNER)
-        self.project = structure_factories.ProjectFactory(customer=self.customer)
-        self.project.add_user(self.users['administrator'], structure_models.ProjectRole.ADMINISTRATOR)
-        self.project_group = structure_factories.ProjectGroupFactory(customer=self.customer)
-        self.project_group.add_user(self.users['manager'], structure_models.ProjectGroupRole.MANAGER)
-        self.project_group.projects.add(self.project)
-
-        cloud = openstack_factories.OpenStackServiceFactory(customer=self.customer)
-        self.service_project_link = openstack_factories.OpenStackServiceProjectLinkFactory(project=self.project, cloud=cloud)
+        super(PriceEstimateListTest, self).setUp()
 
         self.link_price_estimate = factories.PriceEstimateFactory(
-            year=2012, month=10, scope=self.service_project_link, is_manually_input=True)
+            year=2012, month=10, scope=self.service_project_link)
         self.project_price_estimate = factories.PriceEstimateFactory(scope=self.project, year=2015, month=7)
 
     @data('owner', 'manager', 'administrator')
@@ -77,8 +62,8 @@ class PriceEstimateListTest(test.APITransactionTestCase):
         self.client.force_authenticate(self.users['manager'])
         response = self.client.get(
             factories.PriceEstimateFactory.get_list_url(),
-            data={'start': '{}.{}'.format(self.link_price_estimate.year, self.link_price_estimate.month+1),
-                  'end': '{}.{}'.format(self.project_price_estimate.year, self.project_price_estimate.month+1)})
+            data={'start': '{}.{}'.format(self.link_price_estimate.year, self.link_price_estimate.month + 1),
+                  'end': '{}.{}'.format(self.project_price_estimate.year, self.project_price_estimate.month + 1)})
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data), 1)
@@ -92,103 +77,32 @@ class PriceEstimateListTest(test.APITransactionTestCase):
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
-
-@ddt
-class PriceEstimateCreateTest(test.APITransactionTestCase):
-
-    def setUp(self):
-        self.users = {
-            'staff': structure_factories.UserFactory(username='staff', is_staff=True),
-            'owner': structure_factories.UserFactory(username='owner'),
-            'administrator': structure_factories.UserFactory(username='administrator'),
-            'manager': structure_factories.UserFactory(username='manager'),
-        }
-
-        self.customer = structure_factories.CustomerFactory()
-        self.customer.add_user(self.users['owner'], structure_models.CustomerRole.OWNER)
-        self.project = structure_factories.ProjectFactory(customer=self.customer)
-        self.project.add_user(self.users['administrator'], structure_models.ProjectRole.ADMINISTRATOR)
-        self.project_group = structure_factories.ProjectGroupFactory(customer=self.customer)
-        self.project_group.add_user(self.users['manager'], structure_models.ProjectGroupRole.MANAGER)
-        self.project_group.projects.add(self.project)
-        self.service = openstack_factories.OpenStackServiceFactory(customer=self.customer)
-        self.service_project_link = openstack_factories.OpenStackServiceProjectLinkFactory(
-            project=self.project, service=self.service)
-
-        self.valid_data = {
-            'scope': openstack_factories.OpenStackServiceProjectLinkFactory.get_url(self.service_project_link),
-            'total': 100,
-            'details': {'ram': 50, 'disk': 50},
-            'month': 7,
-            'year': 2015,
-        }
-
-    @data('owner', 'staff')
-    def test_user_can_create_price_estimate(self, user):
-        self.client.force_authenticate(self.users[user])
-        response = self.client.post(factories.PriceEstimateFactory.get_list_url(), data=self.valid_data)
-
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertTrue(models.PriceEstimate.objects.filter(
-            scope=self.service_project_link,
-            is_manually_input=True,
-            month=self.valid_data['month'],
-            year=self.valid_data['year'],
-            is_visible=True).exists()
-        )
-
-    @data('manager', 'administrator')
-    def test_user_without_permissions_can_not_create_price_estimate(self, user):
-        self.client.force_authenticate(self.users[user])
-        response = self.client.post(factories.PriceEstimateFactory.get_list_url(), data=self.valid_data)
-
-        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-
-    @data('owner', 'staff', 'manager', 'administrator')
-    def test_user_cannot_create_price_estimate_for_project(self, user):
-        self.valid_data['scope'] = structure_factories.ProjectFactory.get_url(self.project)
-
-        self.client.force_authenticate(self.users[user])
-        response = self.client.post(factories.PriceEstimateFactory.get_list_url(), data=self.valid_data)
-
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_manually_inputed_price_estimate_replaces_autocalcuted(self):
-        price_estimate = factories.PriceEstimateFactory(
-            scope=self.service_project_link, month=self.valid_data['month'], year=self.valid_data['year'])
+    def test_user_can_define_children_visibility_depth(self):
+        customer_price_estimate = factories.PriceEstimateFactory(scope=self.customer, year=2015, month=7)
+        customer_price_estimate.children.add(self.project_price_estimate)
+        spl_price_estimate = factories.PriceEstimateFactory(scope=self.service_project_link, year=2015, month=7)
+        self.project_price_estimate.children.add(spl_price_estimate)
 
         self.client.force_authenticate(self.users['owner'])
-        response = self.client.post(factories.PriceEstimateFactory.get_list_url(), data=self.valid_data)
 
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        reread_price_estimate = models.PriceEstimate.objects.get(id=price_estimate.id)
-        self.assertFalse(reread_price_estimate.is_visible)
+        response = self.client.get(factories.PriceEstimateFactory.get_url(customer_price_estimate), data={'depth': 1})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # with visibility depth 1 we want to see customer estimate children
+        self.assertEqual(len(response.data['children']), 1)
+        project_estimate_data = response.data['children'][0]
+        self.assertEqual(project_estimate_data['uuid'], self.project_price_estimate.uuid.hex)
+        # with visibility depth 1 we do not want to see grandchildren
+        self.assertNotIn('children', project_estimate_data)
 
 
-class PriceEstimateUpdateTest(test.APITransactionTestCase):
-
+class PriceEstimateUpdateTest(BaseCostTrackingTest):
     def setUp(self):
-        self.users = {
-            'staff': structure_factories.UserFactory(username='staff', is_staff=True),
-            'owner': structure_factories.UserFactory(username='owner'),
-            'administrator': structure_factories.UserFactory(username='administrator'),
-            'manager': structure_factories.UserFactory(username='manager'),
-        }
-
-        self.customer = structure_factories.CustomerFactory()
-        self.customer.add_user(self.users['owner'], structure_models.CustomerRole.OWNER)
-        self.project = structure_factories.ProjectFactory(customer=self.customer)
-        self.project.add_user(self.users['administrator'], structure_models.ProjectRole.ADMINISTRATOR)
-        self.project_group = structure_factories.ProjectGroupFactory(customer=self.customer)
-        self.project_group.add_user(self.users['manager'], structure_models.ProjectGroupRole.MANAGER)
-        self.project_group.projects.add(self.project)
-
-        cloud = openstack_factories.OpenStackServiceFactory(customer=self.customer)
-        self.service_project_link = openstack_factories.OpenStackServiceProjectLinkFactory(project=self.project, cloud=cloud)
+        super(PriceEstimateUpdateTest, self).setUp()
 
         self.price_estimate = factories.PriceEstimateFactory(scope=self.service_project_link)
         self.valid_data = {
-            'scope': openstack_factories.OpenStackServiceProjectLinkFactory.get_url(self.service_project_link),
+            'scope': structure_factories.TestServiceProjectLinkFactory.get_url(self.service_project_link),
             'total': 100,
             'details': {'ram': 50, 'disk': 50},
             'month': 7,
@@ -196,8 +110,8 @@ class PriceEstimateUpdateTest(test.APITransactionTestCase):
         }
 
     def test_price_estimate_scope_cannot_be_updated(self):
-        other_service_project_link = openstack_factories.OpenStackServiceProjectLinkFactory(project=self.project)
-        self.valid_data['scope'] = openstack_factories.OpenStackServiceProjectLinkFactory.get_url(
+        other_service_project_link = structure_factories.TestServiceProjectLinkFactory(project=self.project)
+        self.valid_data['scope'] = structure_factories.TestServiceProjectLinkFactory.get_url(
             other_service_project_link)
 
         self.client.force_authenticate(self.users['staff'])
@@ -212,36 +126,11 @@ class PriceEstimateUpdateTest(test.APITransactionTestCase):
         response = self.client.patch(factories.PriceEstimateFactory.get_url(self.price_estimate), data=self.valid_data)
 
         self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
-        reread_price_estimate = models.PriceEstimate.objects.get(id=self.price_estimate.id)
-        self.assertFalse(reread_price_estimate.is_manually_input)
 
 
-class PriceEstimateDeleteTest(test.APITransactionTestCase):
-
+class PriceEstimateDeleteTest(BaseCostTrackingTest):
     def setUp(self):
-        self.users = {
-            'staff': structure_factories.UserFactory(username='staff', is_staff=True),
-            'owner': structure_factories.UserFactory(username='owner'),
-            'administrator': structure_factories.UserFactory(username='administrator'),
-            'manager': structure_factories.UserFactory(username='manager'),
-        }
-
-        self.customer = structure_factories.CustomerFactory()
-        self.customer.add_user(self.users['owner'], structure_models.CustomerRole.OWNER)
-        self.project = structure_factories.ProjectFactory(customer=self.customer)
-        self.project.add_user(self.users['administrator'], structure_models.ProjectRole.ADMINISTRATOR)
-        self.project_group = structure_factories.ProjectGroupFactory(customer=self.customer)
-        self.project_group.add_user(self.users['manager'], structure_models.ProjectGroupRole.MANAGER)
-        self.project_group.projects.add(self.project)
-
-        cloud = openstack_factories.OpenStackServiceFactory(customer=self.customer)
-        self.service_project_link = openstack_factories.OpenStackServiceProjectLinkFactory(project=self.project, cloud=cloud)
-
-        self.manual_link_price_estimate = factories.PriceEstimateFactory(
-            scope=self.service_project_link, is_manually_input=True)
-        self.auto_link_price_estimate = factories.PriceEstimateFactory(
-            scope=self.service_project_link, is_manually_input=False,
-            month=self.manual_link_price_estimate.month, year=self.manual_link_price_estimate.year)
+        super(PriceEstimateDeleteTest, self).setUp()
         self.project_price_estimate = factories.PriceEstimateFactory(scope=self.project)
 
     def test_autocreated_price_estimate_cannot_be_deleted(self):
@@ -250,10 +139,54 @@ class PriceEstimateDeleteTest(test.APITransactionTestCase):
 
         self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
 
-    def test_autocreated_price_estimate_become_visible_on_manual_estimate_deletion(self):
-        self.client.force_authenticate(self.users['staff'])
-        response = self.client.delete(factories.PriceEstimateFactory.get_url(self.manual_link_price_estimate))
 
-        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
-        reread_auto_link_price_estimate = models.PriceEstimate.objects.get(id=self.auto_link_price_estimate.id)
-        self.assertTrue(reread_auto_link_price_estimate.is_visible)
+class ScopeTypeFilterTest(BaseCostTrackingTest):
+    def setUp(self):
+        super(ScopeTypeFilterTest, self).setUp()
+        resource = structure_factories.TestNewInstanceFactory(service_project_link=self.service_project_link)
+        self.estimates = {
+            'customer': models.PriceEstimate.objects.get(scope=self.customer),
+            'service': models.PriceEstimate.objects.get(scope=self.service),
+            'project': models.PriceEstimate.objects.get(scope=self.project),
+            'service_project_link': models.PriceEstimate.objects.get(scope=self.service_project_link),
+            'resource': models.PriceEstimate.objects.get(scope=resource),
+        }
+
+    def test_user_can_filter_price_estimate_by_scope_type(self):
+        self.client.force_authenticate(self.users['owner'])
+        for scope_type, estimate in self.estimates.items():
+            response = self.client.get(
+                factories.PriceEstimateFactory.get_list_url(),
+                data={'scope_type': scope_type})
+
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(len(response.data), 1, response.data)
+            self.assertEqual(response.data[0]['uuid'], estimate.uuid.hex)
+
+
+class CustomerFilterTest(BaseCostTrackingTest):
+    def setUp(self):
+        super(CustomerFilterTest, self).setUp()
+        resource = structure_factories.TestNewInstanceFactory()
+        link = resource.service_project_link
+        customer = link.customer
+        project = link.project
+        service = link.service
+
+        scopes = {link, customer, project, service, resource}
+        self.estimates = {models.PriceEstimate.objects.get(scope=scope) for scope in scopes}
+        self.customer = customer
+
+        resource2 = structure_factories.TestNewInstanceFactory()
+        resource2_estimate = factories.PriceEstimateFactory(scope=resource2)
+        resource2_estimate.create_ancestors()
+
+    def test_user_can_filter_price_estimate_by_customer_uuid(self):
+        self.client.force_authenticate(self.users['staff'])
+        response = self.client.get(
+            factories.PriceEstimateFactory.get_list_url(),
+            data={'customer': self.customer.uuid.hex})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual({estimate['uuid'] for estimate in response.data},
+                         {estimate.uuid.hex for estimate in self.estimates})

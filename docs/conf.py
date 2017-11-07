@@ -47,7 +47,7 @@ master_doc = 'index'
 
 # General information about the project.
 project = u'NodeConductor'
-copyright = u'2014-2015, OpenNode'
+copyright = u'2014-2016, OpenNode'
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
@@ -265,3 +265,11 @@ texinfo_documents = [
 
 # Example configuration for intersphinx: refer to the Python standard library.
 intersphinx_mapping = {'http://docs.python.org/': None}
+
+import django
+os.environ['DJANGO_SETTINGS_MODULE'] = 'nodeconductor.server.doc_settings'
+django.setup()
+
+# Generate API documentation
+from nodeconductor.core.management.commands.drfdocs import Command
+Command().handle(path='docs/drfapi')

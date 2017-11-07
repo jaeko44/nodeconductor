@@ -8,20 +8,24 @@ from croniter.croniter import croniter
 from datetime import datetime
 from django.apps import apps
 from django.conf import settings
-from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin, UserManager
+from django.contrib.auth.base_user import AbstractBaseUser
+from django.contrib.auth.models import PermissionsMixin, UserManager
 from django.core import validators
-from django.core.exceptions import ObjectDoesNotExist, ValidationError
+from django.core.exceptions import ValidationError
 from django.core.mail import send_mail
 from django.db import models
 from django.utils import timezone as django_timezone
 from django.utils.encoding import force_text, python_2_unicode_compatible
+from django.utils.lru_cache import lru_cache
 from django.utils.translation import ugettext_lazy as _
 from django_fsm import transition, FSMIntegerField
-from uuidfield import UUIDField
-import reversion
+from model_utils import FieldTracker
+from reversion import revisions as reversion
+from reversion.models import Version
 
-from nodeconductor.core.fields import CronScheduleField
-from nodeconductor.logging.log import LoggableMixin
+from nodeconductor.core.fields import CronScheduleField, UUIDField
+from nodeconductor.core.validators import validate_name, MinCronValueValidator
+from nodeconductor.logging.loggers import LoggableMixin
 
 
 logger = logging.getLogger(__name__)
@@ -45,7 +49,7 @@ class NameMixin(models.Model):
     class Meta(object):
         abstract = True
 
-    name = models.CharField(_('name'), max_length=150)
+    name = models.CharField(_('name'), max_length=150, validators=[validate_name])
 
 
 class UiDescribableMixin(DescribableMixin):
@@ -65,7 +69,7 @@ class UuidMixin(models.Model):
     class Meta(object):
         abstract = True
 
-    uuid = UUIDField(auto=True, unique=True)
+    uuid = UUIDField()
 
 
 class ErrorMessageMixin(models.Model):
@@ -78,6 +82,17 @@ class ErrorMessageMixin(models.Model):
     error_message = models.TextField(blank=True)
 
 
+class CoordinatesMixin(models.Model):
+    """
+    Mixin to add a latitude and longitude fields
+    """
+    class Meta(object):
+        abstract = True
+
+    latitude = models.FloatField(null=True, blank=True)
+    longitude = models.FloatField(null=True, blank=True)
+
+
 class ScheduleMixin(models.Model):
     """
     Mixin to add a standardized "schedule" fields.
@@ -85,7 +100,7 @@ class ScheduleMixin(models.Model):
     class Meta(object):
         abstract = True
 
-    schedule = CronScheduleField(max_length=15)
+    schedule = CronScheduleField(max_length=15, validators=[MinCronValueValidator(1)])
     next_trigger_at = models.DateTimeField(null=True)
     timezone = models.CharField(max_length=50, default=django_timezone.get_current_timezone_name)
     is_active = models.BooleanField(default=False)
@@ -113,6 +128,7 @@ class ScheduleMixin(models.Model):
         super(ScheduleMixin, self).save(*args, **kwargs)
 
 
+@python_2_unicode_compatible
 class User(LoggableMixin, UuidMixin, DescribableMixin, AbstractBaseUser, PermissionsMixin):
     username = models.CharField(
         _('username'), max_length=30, unique=True,
@@ -123,15 +139,15 @@ class User(LoggableMixin, UuidMixin, DescribableMixin, AbstractBaseUser, Permiss
         ])
     # Civil number is nullable on purpose, otherwise
     # it wouldn't be possible to put a unique constraint on it
-    civil_number = models.CharField(_('civil number'), max_length=10, unique=True, blank=True, null=True, default=None)
+    civil_number = models.CharField(_('civil number'), max_length=50, unique=True, blank=True, null=True, default=None)
     full_name = models.CharField(_('full name'), max_length=100, blank=True)
     native_name = models.CharField(_('native name'), max_length=100, blank=True)
-    phone_number = models.CharField(_('phone number'), max_length=40, blank=True)
+    phone_number = models.CharField(_('phone number'), max_length=255, blank=True)
     organization = models.CharField(_('organization'), max_length=80, blank=True)
     organization_approved = models.BooleanField(_('organization approved'), default=False,
                                                 help_text=_('Designates whether user organization was approved.'))
     job_title = models.CharField(_('job title'), max_length=40, blank=True)
-    email = models.EmailField(_('email address'), blank=True)
+    email = models.EmailField(_('email address'), max_length=75, blank=True)
 
     is_staff = models.BooleanField(_('staff status'), default=False,
                                    help_text=_('Designates whether the user can log into this admin '
@@ -139,8 +155,19 @@ class User(LoggableMixin, UuidMixin, DescribableMixin, AbstractBaseUser, Permiss
     is_active = models.BooleanField(_('active'), default=True,
                                     help_text=_('Designates whether this user should be treated as '
                                                 'active. Unselect this instead of deleting accounts.'))
+    is_support = models.BooleanField(_('support status'), default=False,
+                                     help_text=_('Designates whether the user is a global support user.'))
     date_joined = models.DateTimeField(_('date joined'), default=django_timezone.now)
+    registration_method = models.CharField(_('registration method'), max_length=50, default='default', blank=True,
+                                           help_text=_('Indicates what registration method were used.'))
+    agreement_date = models.DateTimeField(_('agreement date'), blank=True, null=True,
+                                          help_text=_('Indicates when the user has agreed with the policy.'))
+    preferred_language = models.CharField(max_length=10, blank=True)
+    competence = models.CharField(max_length=255, blank=True)
+    token_lifetime = models.PositiveIntegerField(null=True, help_text=_('Token lifetime in seconds.'),
+                                                 validators=[validators.MinValueValidator(60)])
 
+    tracker = FieldTracker()
     objects = UserManager()
 
     USERNAME_FIELD = 'username'
@@ -151,7 +178,7 @@ class User(LoggableMixin, UuidMixin, DescribableMixin, AbstractBaseUser, Permiss
         verbose_name_plural = _('users')
 
     def get_log_fields(self):
-        return ('uuid', 'full_name', 'native_name', self.USERNAME_FIELD, 'is_staff')
+        return ('uuid', 'full_name', 'native_name', self.USERNAME_FIELD, 'is_staff', 'is_support', 'token_lifetime')
 
     def get_full_name(self):
         # This method is used in django-reversion as name of revision creator.
@@ -169,15 +196,22 @@ class User(LoggableMixin, UuidMixin, DescribableMixin, AbstractBaseUser, Permiss
 
     @classmethod
     def get_permitted_objects_uuids(cls, user):
-        if user.is_staff:
-            return {'user_uuid': cls.objects.all().values_list('uuid', flat=True)}
+        if user.is_staff or user.is_support:
+            return {'user_uuid': cls.objects.values_list('uuid', flat=True)}
         else:
-            return {'user_uuid': [user.uuid.hex]}
+            return {'user_uuid': [user.uuid]}
 
     def clean(self):
+        super(User, self).clean()
         # User email has to be unique or empty
-        if self.email and self.id is None and User.objects.filter(email=self.email).exists():
-            raise ValidationError('User with email "%s" already exists' % self.email)
+        if self.email and User.objects.filter(email=self.email).exclude(id=self.id).exists():
+            raise ValidationError({'email': _('User with email "%s" already exists.') % self.email})
+
+    def __str__(self):
+        if self.full_name:
+            return '%s (%s)' % (self.get_username(), self.full_name)
+
+        return self.get_username()
 
 
 def validate_ssh_public_key(ssh_key):
@@ -190,7 +224,7 @@ def validate_ssh_public_key(ssh_key):
         key_type, key_body = key_parts[0], key_parts[1]
 
         if key_type != 'ssh-rsa':
-            raise ValidationError('Invalid SSH public key type %s, only ssh-rsa is supported' % key_type)
+            raise ValidationError(_('Invalid SSH public key type %s, only ssh-rsa is supported.') % key_type)
 
         data = base64.decodestring(key_body)
         int_len = 4
@@ -200,13 +234,13 @@ def validate_ssh_public_key(ssh_key):
         encoded_key_type = data[int_len:int_len + str_len]
         # Check if the encoded key type equals to the decoded key type
         if encoded_key_type != key_type:
-            raise ValidationError("Invalid encoded SSH public key type %s within the key's body, "
-                                  "only ssh-rsa is supported" % encoded_key_type)
+            raise ValidationError(_("Invalid encoded SSH public key type %s within the key's body, "
+                                    "only ssh-rsa is supported.") % encoded_key_type)
     except IndexError:
-        raise ValidationError('Invalid SSH public key structure')
+        raise ValidationError(_('Invalid SSH public key structure.'))
 
     except (base64.binascii.Error, struct.error):
-        raise ValidationError('Invalid SSH public key body')
+        raise ValidationError(_('Invalid SSH public key body.'))
 
 
 def get_ssh_key_fingerprint(ssh_key):
@@ -217,7 +251,7 @@ def get_ssh_key_fingerprint(ssh_key):
     import hashlib
 
     key_body = base64.b64decode(ssh_key.strip().split()[1].encode('ascii'))
-    fp_plain = hashlib.md5(key_body).hexdigest()
+    fp_plain = hashlib.md5(key_body).hexdigest()  # nosec
     return ':'.join(a + b for a, b in zip(fp_plain[::2], fp_plain[1::2]))
 
 
@@ -235,9 +269,12 @@ class SshPublicKey(LoggableMixin, UuidMixin, models.Model):
     public_key = models.TextField(
         validators=[validators.MaxLengthValidator(2000), validate_ssh_public_key]
     )
+    is_shared = models.BooleanField(default=False)
 
     class Meta(object):
         unique_together = ('user', 'name')
+        verbose_name = _('SSH public key')
+        verbose_name_plural = _('SSH public keys')
 
     def save(self, force_insert=False, force_update=False, using=None, update_fields=None):
         # Fingerprint is always set based on public_key
@@ -245,7 +282,7 @@ class SshPublicKey(LoggableMixin, UuidMixin, models.Model):
             self.fingerprint = get_ssh_key_fingerprint(self.public_key)
         except (IndexError, TypeError):
             logger.exception('Fingerprint calculation has failed')
-            raise ValueError('Public key format is incorrect. Fingerprint calculation has failed.')
+            raise ValueError(_('Public key format is incorrect. Fingerprint calculation has failed.'))
 
         if update_fields and 'public_key' in update_fields and 'fingerprint' not in update_fields:
             update_fields.append('fingerprint')
@@ -253,118 +290,151 @@ class SshPublicKey(LoggableMixin, UuidMixin, models.Model):
         super(SshPublicKey, self).save(force_insert, force_update, using, update_fields)
 
     def __str__(self):
-        return self.name
+        return '%s - %s, user: %s, %s' % (self.name, self.fingerprint, self.user.username, self.user.full_name)
 
 
-class SynchronizationStates(object):
-    NEW = 0
-    SYNCING_SCHEDULED = 1
-    SYNCING = 2
-    IN_SYNC = 3
-    ERRED = 4
-    CREATION_SCHEDULED = 5
-    CREATING = 6
+class RuntimeStateMixin(models.Model):
+    """ Provide runtime_state field """
+    class RuntimeStates(object):
+        ONLINE = 'online'
+        OFFLINE = 'offline'
 
-    CHOICES = (
-        (NEW, _('New')),
-        (CREATION_SCHEDULED, _('Creation Scheduled')),
-        (CREATING, _('Creating')),
-        (SYNCING_SCHEDULED, _('Sync Scheduled')),
-        (SYNCING, _('Syncing')),
-        (IN_SYNC, _('In Sync')),
-        (ERRED, _('Erred')),
-    )
+    class Meta(object):
+        abstract = True
 
-    STABLE_STATES = {IN_SYNC}
-    UNSTABLE_STATES = set(dict(CHOICES).keys()) - STABLE_STATES
+    runtime_state = models.CharField(_('runtime state'), max_length=150, blank=True)
+
+    @classmethod
+    def get_online_state(cls):
+        return cls.RuntimeStates.ONLINE
+
+    @classmethod
+    def get_offline_state(cls):
+        return cls.RuntimeStates.OFFLINE
 
 
-class SynchronizableMixin(ErrorMessageMixin):
+class StateMixin(ErrorMessageMixin):
+    class States(object):
+        CREATION_SCHEDULED = 5
+        CREATING = 6
+        UPDATE_SCHEDULED = 1
+        UPDATING = 2
+        DELETION_SCHEDULED = 7
+        DELETING = 8
+        OK = 3
+        ERRED = 4
+
+        CHOICES = (
+            (CREATION_SCHEDULED, 'Creation Scheduled'),
+            (CREATING, 'Creating'),
+            (UPDATE_SCHEDULED, 'Update Scheduled'),
+            (UPDATING, 'Updating'),
+            (DELETION_SCHEDULED, 'Deletion Scheduled'),
+            (DELETING, 'Deleting'),
+            (OK, 'OK'),
+            (ERRED, 'Erred'),
+        )
+
     class Meta(object):
         abstract = True
 
     state = FSMIntegerField(
-        default=SynchronizationStates.CREATION_SCHEDULED,
-        choices=SynchronizationStates.CHOICES,
+        default=States.CREATION_SCHEDULED,
+        choices=States.CHOICES,
     )
 
-    @transition(field=state, source=SynchronizationStates.CREATION_SCHEDULED, target=SynchronizationStates.CREATING)
+    @property
+    def human_readable_state(self):
+        return force_text(dict(self.States.CHOICES)[self.state])
+
+    @transition(field=state, source=States.CREATION_SCHEDULED, target=States.CREATING)
     def begin_creating(self):
         pass
 
-    @transition(field=state, source=SynchronizationStates.SYNCING_SCHEDULED, target=SynchronizationStates.SYNCING)
-    def begin_syncing(self):
+    @transition(field=state, source=States.UPDATE_SCHEDULED, target=States.UPDATING)
+    def begin_updating(self):
         pass
 
-    @transition(field=state, source=SynchronizationStates.ERRED, target=SynchronizationStates.SYNCING)
-    def begin_recovering(self):
+    @transition(field=state, source=States.DELETION_SCHEDULED, target=States.DELETING)
+    def begin_deleting(self):
         pass
 
-    @transition(field=state, source=SynchronizationStates.IN_SYNC, target=SynchronizationStates.SYNCING_SCHEDULED)
-    def schedule_syncing(self):
+    @transition(field=state, source=[States.OK, States.ERRED], target=States.UPDATE_SCHEDULED)
+    def schedule_updating(self):
         pass
 
-    @transition(field=state, source=SynchronizationStates.NEW, target=SynchronizationStates.CREATION_SCHEDULED)
-    def schedule_creating(self):
+    @transition(field=state, source=[States.OK, States.ERRED], target=States.DELETION_SCHEDULED)
+    def schedule_deleting(self):
         pass
 
-    @transition(field=state, source=[SynchronizationStates.SYNCING, SynchronizationStates.CREATING],
-                target=SynchronizationStates.IN_SYNC)
-    def set_in_sync(self):
+    @transition(field=state, source=[States.UPDATING, States.CREATING],
+                target=States.OK)
+    def set_ok(self):
         pass
 
-    @transition(field=state, source='*', target=SynchronizationStates.ERRED)
+    @transition(field=state, source='*', target=States.ERRED)
     def set_erred(self):
         pass
 
-    @transition(field=state, source=SynchronizationStates.ERRED, target=SynchronizationStates.IN_SYNC)
-    def set_in_sync_from_erred(self):
-        self.error_message = ''
+    @transition(field=state, source=States.ERRED, target=States.OK)
+    def recover(self):
+        pass
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def get_all_models(cls):
+        return [model for model in apps.get_models() if issubclass(model, cls)]
 
 
 class ReversionMixin(object):
+    """ Store historical values of instance, using django-reversion.
 
-    def save(self, save_revision=True, ignore_revision_duplicates=True, **kwargs):
-        if save_revision:
-            with reversion.create_revision():
-                reversion.revision_context_manager.set_ignore_duplicates(ignore_revision_duplicates)
-                return super(ReversionMixin, self).save(**kwargs)
-        return super(ReversionMixin, self).save(**kwargs)
+        Note: `ReversionMixin` model should be registered in django-reversion,
+              using one of supported methods:
+              http://django-reversion.readthedocs.org/en/latest/api.html#registering-models-with-django-reversion
+    """
+
+    def get_version_fields(self):
+        """ Get field that are tracked in object history versions. """
+        options = reversion._get_options(self)
+        return options.fields or [f.name for f in self._meta.fields if f not in options.exclude]
+
+    def _is_version_duplicate(self):
+        """ Define should new version be created for object or no.
+
+            Reasons to provide custom check instead of default `ignore_revision_duplicates`:
+             - no need to compare all revisions - it is OK if right object version exists in any revision;
+             - need to compare object attributes (not serialized data) to avoid
+               version creation on wrong <float> vs <int> comparison;
+        """
+        if self.id is None:
+            return False
+        try:
+            latest_version = Version.objects.get_for_object(self).latest('revision__date_created')
+        except Version.DoesNotExist:
+            return False
+        latest_version_object = latest_version._object_version.object
+        fields = self.get_version_fields()
+        return all([getattr(self, f) == getattr(latest_version_object, f) for f in fields])
+
+    def save(self, **kwargs):
+        if self._is_version_duplicate():
+            return super(ReversionMixin, self).save(**kwargs)
+        with reversion.create_revision():
+            return super(ReversionMixin, self).save(**kwargs)
 
 
-class SerializableAbstractMixin(object):
-
-    def to_string(self):
-        """ Dump an instance into a string preserving model name and object id """
-        model_name = force_text(self._meta)
-        return '{}:{}'.format(model_name, self.pk)
-
-    @staticmethod
-    def parse_model_string(string):
-        """ Recover model class and object id from a string"""
-        model_name, pk = string.split(':')
-        return apps.get_model(model_name), int(pk)
-
-    @classmethod
-    def from_string(cls, objects):
-        """ Recover objects from s string """
-        if not isinstance(objects, (list, tuple)):
-            objects = [objects]
-        for obj in objects:
-            model, pk = cls.parse_model_string(obj)
-            try:
-                yield model._default_manager.get(pk=pk)
-            except ObjectDoesNotExist:
-                continue
-
-
+# XXX: consider renaming it to AffinityMixin
 class DescendantMixin(object):
     """ Mixin to provide child-parent relationships.
-
-    Each descendant model can provide list of its parents.
+        Each related model can provide list of its parents/children.
     """
     def get_parents(self):
         """ Return list instance parents. """
+        return []
+
+    def get_children(self):
+        """ Return list instance children. """
         return []
 
     def get_ancestors(self):
@@ -377,3 +447,38 @@ class DescendantMixin(object):
                 if (parent.__class__, parent.id) not in ancestor_unique_attributes:
                     ancestors.append(parent)
         return ancestors
+
+    def get_descendants(self):
+        def traverse(obj):
+            for child in obj.get_children():
+                yield child
+                for baby in child.get_descendants():
+                    yield baby
+        return list(set(traverse(self)))
+
+
+class AbstractFieldTracker(FieldTracker):
+    """
+    Workaround for abstract models
+    https://gist.github.com/sbnoemi/7618916
+    """
+    def finalize_class(self, sender, name, **kwargs):
+        self.name = name
+        self.attname = '_%s' % name
+        if not hasattr(sender, name):
+            super(AbstractFieldTracker, self).finalize_class(sender, **kwargs)
+
+
+class BackendModelMixin(object):
+    """
+    Represents model that is connected to backend object. 
+
+    This model cannot be created or updated via admin, because we do not support queries to backend from admin interface.
+    """
+
+    @classmethod
+    def get_backend_fields(cls):
+        """
+        Returns a list of fields that are handled on backend.
+        """
+        return ()

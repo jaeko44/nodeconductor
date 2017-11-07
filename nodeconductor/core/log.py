@@ -1,13 +1,19 @@
-from nodeconductor.logging.log import EventLogger, event_logger
+import six
+
+from nodeconductor.logging.loggers import EventLogger, event_logger
 from nodeconductor.core.models import User, SshPublicKey
 
 
 class AuthEventLogger(EventLogger):
     user = User
+    username = six.text_type
 
     class Meta:
         event_types = ('auth_logged_in_with_username',
+                       'auth_login_failed_with_username',
                        'auth_logged_out')
+        event_groups = {'users': event_types}
+        nullable_fields = ['user', 'username']
 
 
 class UserEventLogger(EventLogger):
@@ -19,35 +25,35 @@ class UserEventLogger(EventLogger):
                        'user_update_succeeded',
                        'user_deletion_succeeded',
                        'user_password_updated',
+                       'user_token_lifetime_updated',
                        'user_activated',
                        'user_deactivated')
+        event_groups = {
+            'users': event_types,
+        }
+
+
+class TokenEventLogger(EventLogger):
+    affected_user = User
+
+    class Meta:
+        event_types = ('token_created',)
 
 
 class SshPublicKeyEventLogger(EventLogger):
     ssh_key = SshPublicKey
+    user = User
 
     class Meta:
         event_types = ('ssh_key_creation_succeeded',
                        'ssh_key_deletion_succeeded')
+        event_groups = {
+            'ssh': event_types,
+            'users': event_types,
+        }
 
 
 event_logger.register('auth', AuthEventLogger)
 event_logger.register('user', UserEventLogger)
 event_logger.register('sshkey', SshPublicKeyEventLogger)
-
-
-# Backward compatibility imports
-from nodeconductor.logging.log import TCPEventHandler, RequireEvent, RequireNotEvent
-import warnings
-
-
-class NodeConductorDeprecationWarning(PendingDeprecationWarning):
-    pass
-
-
-warnings.simplefilter('always', NodeConductorDeprecationWarning)
-warnings.warn(
-    "TCPEventHandler and RequireEvent/RequireNotEvent classes have been moved to "
-    "nodeconductor.logging.log and will be removed from nodeconductor.core.log "
-    "in further releases, consider updating your settings",
-    NodeConductorDeprecationWarning)
+event_logger.register('token', TokenEventLogger)

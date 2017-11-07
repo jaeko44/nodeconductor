@@ -2,29 +2,10 @@
 from __future__ import unicode_literals
 
 from django.db import models, migrations
-import jsonfield.fields
-import uuidfield.fields
+import nodeconductor.core.fields
 import django.core.validators
 
-
-class ApplicationTypes(object):
-    WORDPRESS = 'wordpress'
-    POSTGRESQL = 'postgresql'
-    ZIMBRA = 'zimbra'
-    NONE = 'none'
-
-    CHOICES = (
-        (WORDPRESS, 'WordPress'),
-        (POSTGRESQL, 'PostgreSQL'),
-        (ZIMBRA, 'Zimbra'),
-        (NONE, 'None'),
-    )
-
-
-def init_default_application_types(apps, schema_editor):
-    ApplicationType = apps.get_model('cost_tracking', 'ApplicationType')
-    for slug, name in ApplicationTypes.CHOICES:
-        ApplicationType.objects.update_or_create(slug=slug, defaults={'name': name})
+import nodeconductor.core.validators
 
 
 class Migration(migrations.Migration):
@@ -40,10 +21,10 @@ class Migration(migrations.Migration):
             name='PriceEstimate',
             fields=[
                 ('id', models.AutoField(verbose_name='ID', serialize=False, auto_created=True, primary_key=True)),
-                ('uuid', uuidfield.fields.UUIDField(unique=True, max_length=32, editable=False, blank=True)),
+                ('uuid', nodeconductor.core.fields.UUIDField()),
                 ('object_id', models.PositiveIntegerField()),
                 ('total', models.FloatField(default=0)),
-                ('details', jsonfield.fields.JSONField(blank=True)),
+                ('details', nodeconductor.core.fields.JSONField(blank=True)),
                 ('month', models.PositiveSmallIntegerField(validators=[django.core.validators.MaxValueValidator(12), django.core.validators.MinValueValidator(1)])),
                 ('year', models.PositiveSmallIntegerField()),
                 ('is_manually_input', models.BooleanField(default=False)),
@@ -59,7 +40,7 @@ class Migration(migrations.Migration):
             name='PriceListItem',
             fields=[
                 ('id', models.AutoField(verbose_name='ID', serialize=False, auto_created=True, primary_key=True)),
-                ('uuid', uuidfield.fields.UUIDField(unique=True, max_length=32, editable=False, blank=True)),
+                ('uuid', nodeconductor.core.fields.UUIDField()),
                 ('content_type', models.ForeignKey(to='contenttypes.ContentType')),
                 ('object_id', models.PositiveIntegerField()),
                 ('key', models.CharField(max_length=255)),
@@ -78,8 +59,8 @@ class Migration(migrations.Migration):
             name='DefaultPriceListItem',
             fields=[
                 ('id', models.AutoField(verbose_name='ID', serialize=False, auto_created=True, primary_key=True)),
-                ('name', models.CharField(max_length=150, verbose_name='name')),
-                ('uuid', uuidfield.fields.UUIDField(unique=True, max_length=32, editable=False, blank=True)),
+                ('name', models.CharField(max_length=150, verbose_name='name', validators=[nodeconductor.core.validators.validate_name])),
+                ('uuid', nodeconductor.core.fields.UUIDField()),
                 ('key', models.CharField(max_length=255)),
                 ('value', models.DecimalField(default=0, verbose_name=b'Hourly rate', max_digits=9, decimal_places=2)),
                 ('units', models.CharField(max_length=255, blank=True)),
@@ -95,7 +76,7 @@ class Migration(migrations.Migration):
             name='ApplicationType',
             fields=[
                 ('id', models.AutoField(verbose_name='ID', serialize=False, auto_created=True, primary_key=True)),
-                ('name', models.CharField(max_length=150, verbose_name='name')),
+                ('name', models.CharField(max_length=150, verbose_name='name', validators=[nodeconductor.core.validators.validate_name])),
                 ('slug', models.CharField(unique=True, max_length=150)),
             ],
             options={
@@ -103,5 +84,4 @@ class Migration(migrations.Migration):
             },
             bases=(models.Model,),
         ),
-        migrations.RunPython(init_default_application_types),
     ]

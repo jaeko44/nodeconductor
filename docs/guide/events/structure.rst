@@ -48,6 +48,9 @@ Structure events
     **project_creation_succeeded**
         Project has been created.
 
+    **project_name_update_succeeded**
+        Project name has been updated.
+
     **project_update_succeeded**
         Project has been updated.
 
@@ -72,32 +75,40 @@ Structure events
 
 ------------
 
-.. glossary::
+Resource events are generic and contain a field **resource_type** that can be used for discriminating what has been
+affected. Possible values depend on the plugins enabled, for example OpenStack.Instance or SaltStack.ExchangeTenant.
 
-    **resource_imported**
-        Existing resource has been imported from service to project.
-
-    **resource_created**
-        New resource has been created.
-
-    **resource_deleted**
-        Resource has been deleted.
-
-------------
 
 .. glossary::
 
-    **service_settings_sync_failed**
-        Service settings has failed to sync.
+   **resource_creation_scheduled**
+   **resource_creation_succeeded**
+   **resource_creation_failed**
 
-    **service_settings_recovered**
-        Service settings has been recovered.
+      Resource creation events. Emitted on creation of all events, i.e. both VMs and applications.
 
-    **service_project_link_creation_failed**
-        Creation of service project link has failed.
+   **resource_update_succeeded**
 
-    **service_project_link_sync_failed**
-        Synchronization of service project link has failed.
+      Resource update has been updated.
 
-    **service_project_link_recovered**
-        Service project link has been recovered.
+   **resource_deletion_scheduled**
+   **resource_deletion_succeeded**
+   **resource_deletion_failed**
+
+      Resource deletion events.
+
+   **resource_start_scheduled**
+   **resource_start_succeeded**
+   **resource_start_failed**
+   **resource_stop_scheduled**
+   **resource_stop_succeeded**
+   **resource_stop_failed**
+   **resource_restart_scheduled**
+   **resource_restart_succeeded**
+   **resource_restart_failed**
+
+      Events for resources that can change state from online to offline, i.e. virtual machines.
+
+   **resource_import_succeeded**
+
+      Resource has been imported.

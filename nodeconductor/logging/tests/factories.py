@@ -1,10 +1,11 @@
 from __future__ import unicode_literals
 
-from django.core.urlresolvers import reverse
+from django.urls import reverse
 import factory
 
 from nodeconductor.logging import models
 # Dependency from `structure` application exists only in tests
+from nodeconductor.logging.loggers import get_valid_events
 from nodeconductor.structure.tests import factories as structure_factories
 
 
@@ -29,8 +30,6 @@ class EventFactory(object):
         self.fields = {
             '@timestamp': '2015-04-19T16:25:45.376+04:00',
             '@version': 1,
-            'cloud_account_name': 'test_cloud_account_name',
-            'cloud_account_uuid': 'test_cloud_account_uuid',
             'customer_abbreviation': 'TCAN',
             'customer_contact_details': 'test details',
             'customer_name': 'Test cusomter',
@@ -42,8 +41,6 @@ class EventFactory(object):
             'levelname': 'WARNING',
             'logger': 'nodeconductor.test',
             'message': 'Test message',
-            'project_group_name': 'test_group_name',
-            'project_group_uuid': 'test_group_uuid',
             'project_name': 'test_project',
             'project_uuid': 'test_project_uuid',
             'tags': ['_jsonparsefailure'],
@@ -80,3 +77,40 @@ class AlertFactory(factory.DjangoModelFactory):
             alert = AlertFactory()
         url = 'http://testserver' + reverse('alert-detail', kwargs={'uuid': alert.uuid})
         return url if action is None else url + action + '/'
+
+
+class WebHookFactory(factory.DjangoModelFactory):
+    class Meta:
+        model = models.WebHook
+
+    event_types = get_valid_events()[:3]
+    destination_url = 'http://example.com/'
+
+    @classmethod
+    def get_list_url(self):
+        return 'http://testserver' + reverse('webhook-list')
+
+    @classmethod
+    def get_url(self, hook=None):
+        if hook is None:
+            hook = WebHookFactory()
+        return 'http://testserver' + reverse('webhook-detail', kwargs={'uuid': hook.uuid})
+
+
+class PushHookFactory(factory.DjangoModelFactory):
+    class Meta:
+        model = models.PushHook
+
+    event_types = get_valid_events()[:3]
+    token = 'VALID_TOKEN'
+    type = models.PushHook.Type.ANDROID
+
+    @classmethod
+    def get_list_url(self):
+        return 'http://testserver' + reverse('pushhook-list')
+
+    @classmethod
+    def get_url(self, hook=None):
+        if hook is None:
+            hook = PushHookFactory()
+        return 'http://testserver' + reverse('pushhook-detail', kwargs={'uuid': hook.uuid})

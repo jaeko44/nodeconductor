@@ -1,4 +1,56 @@
+from django import VERSION as DJANGO_VERSION
+from django.db import models
 from django.utils import six
+
+from . import exceptions
+
+
+class QuotaLimitField(models.IntegerField):
+    """ Django virtual model field.
+        Could be used to manage quotas transparently as model fields.
+    """
+
+    concrete = False
+
+    def __init__(self, quota_field=None, *args, **kwargs):
+        super(QuotaLimitField, self).__init__(*args, **kwargs)
+        self._quota_field = quota_field
+
+    def db_type(self, connection):
+        # virtual field -- ignore in migrations
+        return None
+
+    def contribute_to_class(self, cls, name):
+        self.model = cls
+        self.name = self.attname = name
+        # setting column as none will tell django to not consider this a concrete field
+        self.column = None
+        # connect myself as the descriptor for this field
+        setattr(cls, name, property(self._get_func(), self._set_func()))
+        cls._meta.add_field(self, private=True)
+
+    def deconstruct(self, *args, **kwargs):
+        name, path, args, kwargs = super(QuotaField, self).deconstruct(*args, **kwargs)
+        return (name, path, args, {'default': kwargs.get('default'), 'to': None})
+
+    def _get_func(self):
+        # retrieve quota limit from related object
+        def func(instance, quota_field=self._quota_field):
+            if instance is None:
+                raise AttributeError("Can only be accessed via instance")
+            try:
+                return instance.quotas.get(name=quota_field).limit
+            except instance.quotas.model.DoesNotExist:
+                return quota_field.default_limit
+        return func
+
+    def _set_func(self):
+        # store quota limit as related object
+        def func(instance, value, quota_field=self._quota_field):
+            # a hook to properly init quota after object saved to DB
+            quota_field.scope_default_limit(instance, value)
+            instance.set_quota_limit(quota_field, value, fail_silently=True)
+        return func
 
 
 class FieldsContainerMeta(type):
@@ -19,17 +71,69 @@ class QuotaField(object):
     """ Base quota field.
 
     Links quota to its scope right after its creation.
-    Allows to define quota initial limit and usage.
+    Allows to define:
+     - default_limit
+     - default_usage
+     - is_backend - is quota represents backend limitation. It is impossible to modify backend quotas.
+     - creation_condition - function that receive quota scope and return True if quota should be created
+                            for given scope. Quota will be created automatically if creation_condition is None.
+
+    Default limit and usage can be defined as callable function.
+    Example:
+        quota_name = QuotaField(default_limit=lambda scope: scope.attr)
     """
 
-    def __init__(self, name=None, default_limit=-1, default_usage=0):
+    def __init__(self, default_limit=-1, default_usage=0, is_backend=False, creation_condition=None):
         self.default_limit = default_limit
         self.default_usage = default_usage
-        self.name = name
+        self.is_backend = is_backend
+        self.creation_condition = creation_condition
+
+    def is_connected_to_scope(self, scope):
+        if self.creation_condition is None:
+            return True
+        return self.creation_condition(scope)
+
+    def scope_default_limit(self, scope, value=None):
+        attr_name = '_default_quota_limit_%s' % self.name
+        if value is not None:
+            setattr(scope, attr_name, value)
+        try:
+            return getattr(scope, attr_name)
+        except AttributeError:
+            return self.default_limit(scope) if six.callable(self.default_limit) else self.default_limit
 
     def get_or_create_quota(self, scope):
-        return scope.quotas.get_or_create(
-            name=self.name, defaults={'limit': self.default_limit, 'usage': self.default_usage})
+        if not self.is_connected_to_scope(scope):
+            raise exceptions.CreationConditionFailedQuotaError(
+                'Wrong scope: Cannot create quota "%s" for scope "%s".' % (self.name, scope))
+        defaults = {
+            'limit': self.scope_default_limit(scope),
+            'usage': self.default_usage(scope) if six.callable(self.default_usage) else self.default_usage,
+        }
+
+        return scope.quotas.get_or_create(name=self.name, defaults=defaults)
+
+    def get_aggregator_quotas(self, quota):
+        """ Fetch ancestors quotas that have the same name and are registered as aggregator quotas. """
+        ancestors = quota.scope.get_quota_ancestors()
+        aggregator_quotas = []
+        for ancestor in ancestors:
+            for ancestor_quota_field in ancestor.get_quotas_fields(field_class=AggregatorQuotaField):
+                if ancestor_quota_field.get_child_quota_name() == quota.name:
+                    aggregator_quotas.append(ancestor.quotas.get(name=ancestor_quota_field))
+        return aggregator_quotas
+
+    def __str__(self):
+        return self.name
+
+    def recalculate(self, scope):
+        if not self.is_connected_to_scope(scope):
+            return
+        self.recalculate_usage(scope)
+
+    def recalculate_usage(self, scope):
+        pass
 
 
 class CounterQuotaField(QuotaField):
@@ -77,41 +181,72 @@ class CounterQuotaField(QuotaField):
 
     def add_usage(self, target_instance, delta, fail_silently=False):
         scope = self._get_scope(target_instance)
-        scope.add_quota_usage(self.name, delta, fail_silently=fail_silently)
+        if self.is_connected_to_scope(scope):
+            scope.add_quota_usage(self.name, delta, fail_silently=fail_silently)
 
     def _get_scope(self, target_instance):
         return reduce(getattr, self.path_to_scope.split('.'), target_instance)
 
 
-# Aggregated quotas fields are used only for recalculation now.
-# Other part of aggregation logic is done in add_quota_usage and
-# set_quota_usage models methods and it is executed for all quotas.
-# Ideally all logic should be located in one place.
-#
-# XXX: Aggregation should be executed only for aggregation fields.
-#      (Currently it is executed for all scope parents quotas).
 class AggregatorQuotaField(QuotaField):
-    """ Aggregates sum of quota scope children with the same name
+    """ Aggregates sum of quota scope children with the same name.
 
-        Automatically increases/decreases usage if corresponding child quota changed.
+        Automatically increases/decreases usage if corresponding child quota <aggregation_field> changed.
 
         Example:
             # This quota will store sum of all customer projects resources
-            nc_resource_count = quotas_fields.AggregatorQuotaField(
+            nc_resource_count = quotas_fields.UsageAggregatorQuotaField(
                 get_children=lambda customer: customer.projects.all(),
             )
     """
+    aggregation_field = NotImplemented
 
-    def __init__(self, get_children, **kwargs):
+    def __init__(self, get_children, child_quota_name=None, **kwargs):
         self.get_children = get_children
+        self._child_quota_name = child_quota_name
         super(AggregatorQuotaField, self).__init__(**kwargs)
+
+    def get_child_quota_name(self):
+        return self._child_quota_name if self._child_quota_name is not None else self.name
 
     def recalculate_usage(self, scope):
         children = self.get_children(scope)
         current_usage = 0
         for child in children:
-            current_usage += child.quotas.get(name=self.name).usage
+            child_quota = child.quotas.get(name=self.get_child_quota_name())
+            current_usage += getattr(child_quota, self.aggregation_field)
         scope.set_quota_usage(self.name, current_usage)
 
+    def post_child_quota_save(self, scope, child_quota, created=False):
+        quota = scope.quotas.get(name=self.name)
+        current_value = getattr(child_quota, self.aggregation_field)
+        if created:
+            diff = current_value
+        else:
+            diff = current_value - child_quota.tracker.previous(self.aggregation_field)
+        if diff:
+            quota.usage += diff
+            quota.save()
+
+    def pre_child_quota_delete(self, scope, child_quota):
+        quota = scope.quotas.get(name=self.name)
+        diff = getattr(child_quota, self.aggregation_field)
+        if diff:
+            quota.usage -= diff
+            quota.save()
+
+
+class UsageAggregatorQuotaField(AggregatorQuotaField):
+    """ Aggregates sum children quotas usages.
+
+        Note! It is impossible to aggregate usage of another usage aggregator quotas.
+        This restriction was added to avoid calls duplications on quota usage field update.
+    """
+    aggregation_field = 'usage'
+
+
+class LimitAggregatorQuotaField(AggregatorQuotaField):
+    """ Aggregates sum children quotas limits. """
+    aggregation_field = 'limit'
 
 # TODO: Implement GlobalQuotaField and GlobalCounterQuotaField

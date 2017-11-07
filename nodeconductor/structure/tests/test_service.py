@@ -1,131 +1,102 @@
+from django.db import models
+from rest_framework import status, test
 
-import factory
-
-from mock import patch
-from mock_django import mock_signal_receiver
-from django.core.urlresolvers import reverse
-from rest_framework import test, status
-
-from nodeconductor.iaas.models import OpenStackSettings
-from nodeconductor.core.models import SynchronizationStates
-from nodeconductor.core.tests.helpers import override_nodeconductor_settings
-from nodeconductor.structure import SupportedServices, signals
-from nodeconductor.structure.models import Customer, CustomerRole
-from nodeconductor.structure.tests import factories
+from nodeconductor.structure.models import ProjectRole
+from nodeconductor.structure.tests import factories, fixtures, models as test_models
 
 
-class SuspendServiceTest(test.APITransactionTestCase):
-
+class ServiceCreateTest(test.APITransactionTestCase):
     def setUp(self):
-        self.user = factories.UserFactory()
-        self.customer = factories.CustomerFactory(balance=-10)
-        self.customer.add_user(self.user, CustomerRole.OWNER)
+        self.fixture = fixtures.ProjectFixture()
+        self.customer_url = factories.CustomerFactory.get_url(self.fixture.customer)
+        self.client.force_authenticate(self.fixture.owner)
 
-    def _get_url(self, view_name, **kwargs):
-        return 'http://testserver' + reverse(view_name, kwargs=kwargs)
+    def test_if_required_fields_is_not_specified_error_raised(self):
+        response = self.client.post(factories.TestServiceFactory.get_list_url(), {
+            'name': 'Test service',
+            'customer': self.customer_url,
+            'backend_url': 'http://example.com/',
+        })
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('username', response.data)
 
-    def test_debit_customer(self):
-        amount = 9.99
-        customer = factories.CustomerFactory()
+    def test_validate_required_fields(self):
+        response = self.client.post(factories.TestServiceFactory.get_list_url(), {
+            'name': 'Test service',
+            'customer': self.customer_url,
+            'backend_url': 'http://example.com/',
+            'username': 'admin',
+            'password': 'secret',
+        })
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
-        with patch('celery.app.base.Celery.send_task') as mocked_task:
-            with mock_signal_receiver(signals.customer_account_debited) as receiver:
-                customer.debit_account(amount)
 
-                receiver.assert_called_once_with(
-                    instance=customer,
-                    amount=amount,
-                    sender=Customer,
-                    signal=signals.customer_account_debited,
-                )
+class ServiceResourcesCounterTest(test.APITransactionTestCase):
+    """
+    There's one shared service. Also there are 2 users each of which has one project.
+    There's one VM in each project. Service counters for each user should equal 1.
+    For staff user resource counter should equal 2.
+    """
+    def setUp(self):
+        self.customer = factories.CustomerFactory()
+        self.settings = factories.ServiceSettingsFactory(shared=True)
+        self.service = factories.TestServiceFactory(customer=self.customer, settings=self.settings)
 
-                mocked_task.assert_called_once_with(
-                    'nodeconductor.structure.stop_customer_resources',
-                    (customer.uuid.hex,), {}, countdown=2)
+        self.user1 = factories.UserFactory()
+        self.project1 = factories.ProjectFactory(customer=self.customer)
+        self.project1.add_user(self.user1, ProjectRole.ADMINISTRATOR)
+        self.spl1 = factories.TestServiceProjectLinkFactory(service=self.service, project=self.project1)
+        self.vm1 = factories.TestNewInstanceFactory(service_project_link=self.spl1)
 
-                self.assertEqual(customer.balance, -1 * amount)
+        self.user2 = factories.UserFactory()
+        self.project2 = factories.ProjectFactory(customer=self.customer)
+        self.project2.add_user(self.user2, ProjectRole.ADMINISTRATOR)
+        self.spl2 = factories.TestServiceProjectLinkFactory(service=self.service, project=self.project2)
+        self.vm2 = factories.TestNewInstanceFactory(service_project_link=self.spl2)
 
-    def test_credit_customer(self):
-        amount = 7.45
-        customer = factories.CustomerFactory()
+        self.service_url = factories.TestServiceFactory.get_url(self.service)
 
-        with mock_signal_receiver(signals.customer_account_credited) as receiver:
-            customer.credit_account(amount)
+    def test_counters_for_shared_providers_should_be_filtered_by_user(self):
+        self.client.force_authenticate(self.user1)
+        response = self.client.get(self.service_url)
+        self.assertEqual(1, response.data['resources_count'])
 
-            receiver.assert_called_once_with(
-                instance=customer,
-                amount=amount,
-                sender=Customer,
-                signal=signals.customer_account_credited,
-            )
+        self.client.force_authenticate(self.user2)
+        response = self.client.get(self.service_url)
+        self.assertEqual(1, response.data['resources_count'])
 
-            self.assertEqual(customer.balance, amount)
+    def test_counters_are_not_filtered_for_staff(self):
+        self.client.force_authenticate(factories.UserFactory(is_staff=True))
+        response = self.client.get(self.service_url)
+        self.assertEqual(2, response.data['resources_count'])
 
-    # XXX: This test is too complex and tries to cover too many applications in one. It has to be  rewritten.
-    # Possible solutions:
-    #  1. Make this text abstract and override it in other applications.
-    #  2. Register factories and other test related stuff for each application and use them in this test.
-    @override_nodeconductor_settings(SUSPEND_UNPAID_CUSTOMERS=True)
-    def test_modify_suspended_services_and_resources(self):
-        self.client.force_authenticate(user=self.user)
+    def test_subresources_are_skipped(self):
+        subresource = factories.TestSubResourceFactory(service_project_link=self.spl1)
+        self.client.force_authenticate(self.user1)
+        response = self.client.get(self.service_url)
+        self.assertEqual(1, response.data['resources_count'])
 
-        for service_type, models in SupportedServices.get_service_models().items():
-            # XXX: quick fix for iaas cloud. Can be removed after iaas application refactoring.
-            if service_type == -1:
-                continue
-            settings = factories.ServiceSettingsFactory(
-                customer=self.customer, type=service_type, shared=True)
 
-            class ServiceFactory(factory.DjangoModelFactory):
-                class Meta(object):
-                    model = models['service']
+class UnlinkServiceTest(test.APITransactionTestCase):
+    def test_when_service_is_unlinked_all_related_resources_are_unlinked_too(self):
+        resource = factories.TestNewInstanceFactory()
+        service = resource.service_project_link.service
+        unlink_url = factories.TestServiceFactory.get_url(service, 'unlink')
 
-            class ServiceProjectLinkFactory(factory.DjangoModelFactory):
-                class Meta(object):
-                    model = models['service_project_link']
+        self.client.force_authenticate(factories.UserFactory(is_staff=True))
+        response = self.client.post(unlink_url)
 
-            if service_type == SupportedServices.Types.IaaS:
-                service = ServiceFactory(customer=self.customer, state=SynchronizationStates.IN_SYNC)
-                OpenStackSettings.objects.get_or_create(
-                    auth_url='http://example.com:5000/v2',
-                    defaults={
-                        'username': 'admin',
-                        'password': 'password',
-                        'tenant_name': 'admin',
-                    })
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertRaises(models.ObjectDoesNotExist, service.refresh_from_db)
 
-            else:
-                service = models['service'].objects.create(
-                    customer=self.customer, settings=settings, name=settings.name, available_for_all=True)
+    def test_owner_cannot_unlink_service_with_shared_settings(self):
+        fixture = fixtures.ServiceFixture()
+        service_settings = factories.ServiceSettingsFactory(shared=True)
+        service = test_models.TestService.objects.get(customer=fixture.customer, settings=service_settings)
+        unlink_url = factories.TestServiceFactory.get_url(service, 'unlink')
+        self.client.force_authenticate(fixture.owner)
 
-            service_url = self._get_url(
-                SupportedServices.get_detail_view_for_model(models['service']), uuid=service.uuid.hex)
+        response = self.client.post(unlink_url)
 
-            response = self.client.patch(service_url, {'name': 'new name'})
-            self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-
-            response = self.client.delete(service_url)
-            self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-
-            for resource_model in models['resources']:
-                if service_type == SupportedServices.Types.IaaS:
-                    continue
-
-                class ResourceFactory(factory.DjangoModelFactory):
-                    class Meta(object):
-                        model = resource_model
-
-                project = factories.ProjectFactory(customer=self.customer)
-                spl = models['service_project_link'].objects.get(service=service, project=project)
-
-                # XXX: Some resources can have more required fields and creation will fail. Lets just skip them.
-                try:
-                    resource = ResourceFactory(service_project_link=spl)
-                except:
-                    pass
-                else:
-                    resource_url = self._get_url(
-                        SupportedServices.get_detail_view_for_model(resource_model), uuid=resource.uuid.hex)
-
-                    response = self.client.post(resource_url + 'start/')
-                    self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(test_models.TestService.objects.filter(pk=service.pk).exists())

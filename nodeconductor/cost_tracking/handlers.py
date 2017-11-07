@@ -1,122 +1,103 @@
+from __future__ import unicode_literals
+
 import logging
 
-from django.contrib.contenttypes.models import ContentType
+from celery import current_task
+from dateutil.relativedelta import relativedelta
+from django.utils import timezone
 
-from nodeconductor.core.tasks import send_task
-from nodeconductor.cost_tracking import models
-from nodeconductor.structure.models import Resource
-from nodeconductor.structure import SupportedServices
+from nodeconductor.core import utils as core_utils
+from nodeconductor.cost_tracking import models, CostTrackingRegister, ResourceNotRegisteredError
+from nodeconductor.structure import models as structure_models
 
-
-logger = logging.getLogger('nodeconductor.cost_tracking')
-
-
-def add_estimate_costs(sender, instance, name=None, source=None, **kwargs):
-    if source == instance.States.PROVISIONING and name == instance.set_online.__name__:
-        send_task('cost_tracking', 'update_projected_estimate')(
-            resource_uuid=instance.uuid.hex)
+logger = logging.getLogger(__name__)
 
 
-def make_autocalculate_price_estimate_invisible_on_manual_estimate_creation(sender, instance, created=False, **kwargs):
-    if created and instance.is_manually_input:
-        manually_created_price_estimate = instance
-        (models.PriceEstimate.objects
-            .filter(scope=manually_created_price_estimate.scope,
-                    year=manually_created_price_estimate.year,
-                    month=manually_created_price_estimate.month,
-                    is_manually_input=False)
-            .update(is_visible=False))
+def scope_deletion(sender, instance, **kwargs):
+    """ Run different actions on price estimate scope deletion.
 
+        If scope is a customer - delete all customer estimates and their children.
+        If scope is a deleted resource - redefine consumption details, recalculate
+                                         ancestors estimates and update estimate details.
+        If scope is a unlinked resource - delete all resource price estimates and update ancestors.
+        In all other cases - update price estimate details.
+    """
 
-def make_autocalculated_price_estimate_visible_on_manual_estimate_deletion(sender, instance, **kwargs):
-    deleted_price_estimate = instance
-    if deleted_price_estimate.is_manually_input:
-        (models.PriceEstimate.objects
-            .filter(scope=deleted_price_estimate.scope,
-                    year=deleted_price_estimate.year,
-                    month=deleted_price_estimate.month,
-                    is_manually_input=False)
-            .update(is_visible=True))
-
-
-def make_autocalculate_price_estimate_invisible_if_manually_created_estimate_exists(
-        sender, instance, created=False, **kwargs):
-    if created and not instance.is_manually_input:
-        if models.PriceEstimate.objects.filter(
-                year=instance.year, scope=instance.scope, month=instance.month, is_manually_input=True).exists():
-            instance.is_visible = False
-
-
-def create_price_list_items_for_service(sender, instance, created=False, **kwargs):
-    if created:
-        service = instance
-        resource_content_type = ContentType.objects.get_for_model(service)
-        for default_item in models.DefaultPriceListItem.objects.filter(resource_content_type=resource_content_type):
-            models.PriceListItem.objects.create(
-                resource_content_type=resource_content_type,
-                service=service,
-                key=default_item.key,
-                item_type=default_item.item_type,
-                value=default_item.value,
-                units=default_item.units,
-            )
-
-
-def change_price_list_items_if_default_was_changed(sender, instance, created=False, **kwargs):
-    default_item = instance
-    if created:
-        # if new default item added - we create such item in for each service
-        model = default_item.resource_content_type.model_class()
-        service_class = SupportedServices.get_related_models(model)['service']
-        for service in service_class.objects.all():
-            models.PriceListItem.objects.create(
-                resource_content_type=default_item.resource_content_type,
-                service=service,
-                key=default_item.key,
-                item_type=default_item.item_type,
-                units=default_item.units,
-                value=default_item.value
-            )
+    is_resource = isinstance(instance, structure_models.ResourceMixin)
+    if is_resource and getattr(instance, 'PERFORM_UNLINK', False):
+        _resource_unlink(resource=instance)
+    elif is_resource and not getattr(instance, 'PERFORM_UNLINK', False):
+        _resource_deletion(resource=instance)
+    elif isinstance(instance, structure_models.Customer):
+        _customer_deletion(customer=instance)
     else:
-        if default_item.tracker.has_changed('key') or default_item.tracker.has_changed('item_type'):
-            # if default item key or item type was changed - it will be changed in each connected item
-            connected_items = models.PriceListItem.objects.filter(
-                key=default_item.tracker.previous('key'),
-                item_type=default_item.tracker.previous('item_type'),
-                resource_content_type=default_item.resource_content_type,
-            )
-        else:
-            # if default value or units changed - it will be changed in each connected item
-            # that was not edited manually
-            connected_items = models.PriceListItem.objects.filter(
-                key=default_item.key,
-                item_type=default_item.item_type,
-                resource_content_type=default_item.resource_content_type,
-                is_manually_input=False,
-            )
-        connected_items.update(
-            key=default_item.key, item_type=default_item.item_type, units=default_item.units, value=default_item.value)
+        for price_estimate in models.PriceEstimate.objects.filter(scope=instance):
+            price_estimate.init_details()
 
 
-def delete_price_list_items_if_default_was_deleted(sender, instance, **kwargs):
-    default_item = instance
-    models.PriceListItem.objects.filter(
-        key=default_item.tracker.previous('key'),
-        item_type=default_item.tracker.previous('item_type'),
-        resource_content_type=default_item.resource_content_type,
-    ).delete()
+def _resource_unlink(resource):
+    if resource.__class__ not in CostTrackingRegister.registered_resources:
+        return
+    for price_estimate in models.PriceEstimate.objects.filter(scope=resource):
+        price_estimate.update_ancestors_total(diff=-price_estimate.total)
+        price_estimate.delete()
 
 
-def delete_price_estimate_on_scope_deletion(sender, instance, **kwargs):
-    if isinstance(instance, tuple(Resource.get_all_models())):
-        is_unlink = getattr(instance, 'PERFORM_UNLINK', False)
-        if is_unlink:
-            models.PriceEstimate.update_price_for_resource(instance, delete=True)
-            return
+def _customer_deletion(customer):
+    for estimate in models.PriceEstimate.objects.filter(scope=customer):
+        for descendant in estimate.get_descendants():
+            descendant.delete()
 
-    estimates = models.PriceEstimate.objects.filter(scope=instance)
-    # Set estimates total to zero before deletion - to update ancestors estimate
-    for estimate in estimates.filter(is_manually_input=False):
-        models.PriceEstimate.update_price_for_scope(instance, month=estimate.month, year=estimate.year, total=0)
 
-    estimates.delete()
+def _resource_deletion(resource):
+    """ Recalculate consumption details and save resource details """
+    if resource.__class__ not in CostTrackingRegister.registered_resources:
+        return
+    new_configuration = {}
+    price_estimate = models.PriceEstimate.update_resource_estimate(resource, new_configuration)
+    price_estimate.init_details()
+
+
+def _is_in_celery_task():
+    """ Return True if current code is executed in celery task """
+    return bool(current_task)
+
+
+def resource_update(sender, instance, created=False, **kwargs):
+    """ Update resource consumption details and price estimate if its configuration has changed.
+        Create estimates for previous months if resource was created not in current month.
+    """
+    resource = instance
+    try:
+        new_configuration = CostTrackingRegister.get_configuration(resource)
+    except ResourceNotRegisteredError:
+        return
+    models.PriceEstimate.update_resource_estimate(
+        resource, new_configuration, raise_exception=not _is_in_celery_task())
+    # Try to create historical price estimates
+    if created:
+        _create_historical_estimates(resource, new_configuration)
+
+
+def resource_quota_update(sender, instance, **kwargs):
+    """ Update resource consumption details and price estimate if its configuration has changed """
+    quota = instance
+    resource = quota.scope
+    try:
+        new_configuration = CostTrackingRegister.get_configuration(resource)
+    except ResourceNotRegisteredError:
+        return
+    models.PriceEstimate.update_resource_estimate(
+        resource, new_configuration, raise_exception=not _is_in_celery_task())
+
+
+def _create_historical_estimates(resource, configuration):
+    """ Create consumption details and price estimates for past months.
+
+        Usually we need to update historical values on resource import.
+    """
+    today = timezone.now()
+    month_start = core_utils.month_start(today)
+    while month_start > resource.created:
+        month_start -= relativedelta(months=1)
+        models.PriceEstimate.create_historical(resource, configuration, max(month_start, resource.created))

@@ -3,9 +3,8 @@ Event types
 
 Following event types are emitted by NodeConductor.
 
-.. include:: events/backup.rst
-.. include:: events/iaas.rst
-.. include:: events/core.rst
-.. include:: events/structure.rst
-.. include:: events/template.rst
-.. include:: events/invoices.rst
+.. include:: /guide/events/core.rst
+.. include:: /guide/events/structure.rst
+.. include:: /guide/events/template.rst
+.. include:: /guide/events/invoices.rst
+.. include:: /guide/events/custom.rst

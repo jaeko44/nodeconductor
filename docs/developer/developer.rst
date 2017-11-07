@@ -1,10 +1,12 @@
 .. include:: development_guideline.rst
-.. include:: plugin.rst
-.. include:: ssh-keys.rst
+.. include:: documentation.rst
+.. include:: plugins.rst
 .. include:: permissions.rst
 .. include:: managed-entities.rst
-.. include:: openstack.rst
 .. include:: logging.rst
 .. include:: quotas.rst
-.. include:: celery.rst
-.. include:: extensions.rst
+.. include:: tasks-and-executors.rst
+.. include:: how-to-write-imports.rst
+.. include:: how-to-write-tests.rst
+.. include:: how-to-write-docs.rst
+.. include:: i18n.rst

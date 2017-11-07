@@ -1,87 +1,120 @@
-import factory
+import unittest
 
 from rest_framework import test, status
 
-from nodeconductor.iaas.models import OpenStackSettings
-from nodeconductor.core.models import SynchronizationStates
-from nodeconductor.structure import SupportedServices
-from nodeconductor.structure.models import CustomerRole
-from nodeconductor.structure.tests import factories
+from nodeconductor.core import models as core_models
+from nodeconductor.structure.models import NewResource, ServiceSettings
+from nodeconductor.structure.tests import factories, fixtures, models as test_models
 
 
-class ResourceQuotasTest(test.APITransactionTestCase):
+States = core_models.StateMixin.States
 
+
+class ResourceRemovalTest(test.APITransactionTestCase):
     def setUp(self):
-        self.user = factories.UserFactory()
-        self.customer = factories.CustomerFactory()
-        self.customer.add_user(self.user, CustomerRole.OWNER)
-        self.project = factories.ProjectFactory(customer=self.customer)
-
-    def test_auto_quotas_update(self):
-        for service_type, models in SupportedServices.get_service_models().items():
-            settings = factories.ServiceSettingsFactory(customer=self.customer, type=service_type, shared=False)
-
-            class ServiceFactory(factory.DjangoModelFactory):
-                class Meta(object):
-                    model = models['service']
-
-            class ServiceProjectLinkFactory(factory.DjangoModelFactory):
-                class Meta(object):
-                    model = models['service_project_link']
-
-            if service_type == SupportedServices.Types.IaaS:
-                service = ServiceFactory(customer=self.customer, state=SynchronizationStates.IN_SYNC)
-                OpenStackSettings.objects.get_or_create(
-                    auth_url='http://example.com:5000/v2',
-                    defaults={
-                        'username': 'admin',
-                        'password': 'password',
-                        'tenant_name': 'admin',
-                    })
-
-            else:
-                service = ServiceFactory(customer=self.customer, settings=settings)
-
-            for resource_model in models['resources']:
-                if not hasattr(resource_model, 'update_quota_usage'):
-                    continue
-
-                class ResourceFactory(factory.DjangoModelFactory):
-                    class Meta(object):
-                        model = resource_model
-
-                data = {'cores': 4, 'ram': 1024, 'disk': 20480}
-
-                service_project_link = ServiceProjectLinkFactory(service=service, project=self.project)
-                resource = ResourceFactory(service_project_link=service_project_link, cores=data['cores'])
-
-                self.assertEqual(service_project_link.quotas.get(name='instances').usage, 1)
-                self.assertEqual(service_project_link.quotas.get(name='vcpu').usage, data['cores'])
-                self.assertEqual(service_project_link.quotas.get(name='ram').usage, 0)
-                self.assertEqual(service_project_link.quotas.get(name='storage').usage, 0)
-
-                resource.ram = data['ram']
-                resource.disk = data['disk']
-                resource.save()
-
-                self.assertEqual(service_project_link.quotas.get(name='ram').usage, data['ram'])
-                self.assertEqual(service_project_link.quotas.get(name='storage').usage, data['disk'])
-
-                resource.delete()
-                self.assertEqual(service_project_link.quotas.get(name='instances').usage, 0)
-                self.assertEqual(service_project_link.quotas.get(name='vcpu').usage, 0)
-                self.assertEqual(service_project_link.quotas.get(name='ram').usage, 0)
-                self.assertEqual(service_project_link.quotas.get(name='storage').usage, 0)
-
-
-class ResourceUnlinkingTest(test.APITransactionTestCase):
-    def setUp(self):
-        from nodeconductor.openstack.tests.factories import InstanceFactory
         self.user = factories.UserFactory(is_staff=True)
-        self.vm = InstanceFactory()
-        self.url = InstanceFactory.get_url(self.vm)
-
-    def test_vm_can_be_unlinked_in_erred_state(self):
         self.client.force_authenticate(user=self.user)
-        response = self.client.post(self.url + 'unlink/')
-        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+
+    @unittest.skip('Unlink operation is not supported for new style resources yet.')
+    def test_vm_unlinked_immediately_anyway(self):
+        vm = factories.TestNewInstanceFactory(state=States.UPDATING)
+        url = factories.TestNewInstanceFactory.get_url(vm, 'unlink')
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT, response.data)
+
+    @unittest.skip('Unlink operation is not supported for new style resources yet.')
+    def test_new_resource_unlinked_immediately(self):
+        vm = factories.TestNewInstanceFactory(state=NewResource.States.OK)
+        url = factories.TestNewInstanceFactory.get_url(vm, 'unlink')
+
+        response = self.client.post(url)
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT, response.data)
+
+    def test_when_virtual_machine_is_deleted_descendant_resources_unlinked(self):
+        # Arrange
+        vm = factories.TestNewInstanceFactory()
+        settings = factories.ServiceSettingsFactory(scope=vm)
+        service = factories.TestServiceFactory(settings=settings)
+        link = factories.TestServiceProjectLinkFactory(service=service)
+        child_vm = factories.TestNewInstanceFactory(service_project_link=link)
+        other_vm = factories.TestNewInstanceFactory()
+
+        # Act
+        vm.delete()
+
+        # Assert
+        self.assertFalse(test_models.TestNewInstance.objects.filter(id=child_vm.id).exists())
+        self.assertFalse(test_models.TestService.objects.filter(id=service.id).exists())
+        self.assertFalse(ServiceSettings.objects.filter(id=settings.id).exists())
+        self.assertTrue(test_models.TestNewInstance.objects.filter(id=other_vm.id).exists())
+
+
+class ResourceCreateTest(test.APITransactionTestCase):
+
+    def setUp(self):
+        self.user = factories.UserFactory(is_staff=True)
+        self.client.force_authenticate(user=self.user)
+        self.service_project_link = factories.TestServiceProjectLinkFactory()
+
+    def test_resource_cannot_be_created_for_invalid_service_project_link(self):
+        self.service_project_link.project.certifications.add(factories.ServiceCertificationFactory())
+        self.assertFalse(self.service_project_link.is_valid)
+        payload = {
+            'service_project_link': factories.TestServiceProjectLinkFactory.get_url(self.service_project_link),
+            'name': 'impossible resource',
+        }
+        url = factories.TestNewInstanceFactory.get_list_url()
+
+        response = self.client.post(url, payload)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('service_project_link', response.data)
+
+
+class ResourceTagsTest(test.APITransactionTestCase):
+    def setUp(self):
+        self.fixture = fixtures.ServiceFixture()
+        self.client.force_authenticate(user=self.fixture.staff)
+
+    def test_resource_tags_are_rendered_as_list(self):
+        self.fixture.resource.tags.add('tag1')
+        self.fixture.resource.tags.add('tag2')
+
+        url = factories.TestNewInstanceFactory.get_url(self.fixture.resource)
+        response = self.client.get(url)
+        self.assertEqual(response.data['tags'], ['tag1', 'tag2'])
+
+    def test_tags_are_saved_on_resource_provision(self):
+        payload = {
+            'service_project_link': factories.TestServiceProjectLinkFactory.get_url(self.fixture.service_project_link),
+            'name': 'Tagged resource',
+            'tags': ['tag1', 'tag2']
+        }
+        url = factories.TestNewInstanceFactory.get_list_url()
+
+        response = self.client.post(url, payload)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertItemsEqual(response.data['tags'], ['tag1', 'tag2'])
+
+    def test_tags_are_saved_on_resource_modification(self):
+        resource = self.fixture.resource
+        resource.state = test_models.TestNewInstance.States.OK
+        resource.save()
+        resource.tags.add('tag1')
+        resource.tags.add('tag2')
+        payload = {'tags': []}
+        url = factories.TestNewInstanceFactory.get_url(resource)
+
+        response = self.client.patch(url, payload)
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data['tags'], [])
+
+    def test_resource_can_be_filtered_by_tag(self):
+        self.fixture.resource.tags.add('tag1')
+        resource2 = factories.TestNewInstanceFactory(service_project_link=self.fixture.service_project_link)
+        resource2.tags.add('tag2')
+
+        url = factories.TestNewInstanceFactory.get_list_url()
+        response = self.client.get(url, {'tag': 'tag1'})
+        self.assertEqual(len(response.data), 1)

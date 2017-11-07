@@ -22,24 +22,40 @@ Guide
    changelog
    guide/intro
 
+
 API
 ---
 
 .. toctree::
    :maxdepth: 1
 
+   drfapi/index
+
+IAAS
+----
+
+.. toctree::
+   :maxdepth: 1
+
    api/api
 
-NodeConductor Plugins
+NodeConductor plugins
 ---------------------
 
 .. toctree::
    :maxdepth: 1
 
-   plugins/openstack/intro
+   plugins/azure
+   plugins/jira
+   plugins/killbill
+   plugins/openstack
+   plugins/oracle
    plugins/organization
+   plugins/paypal
    plugins/saltstack
+   plugins/saml2
    plugins/sugarcrm
+   plugins/zabbix
 
 Developing NodeConductor
 ------------------------
@@ -54,7 +70,7 @@ Developing NodeConductor
 License
 -------
 
-NodeConductor is open-source under Apache v2 license.
+NodeConductor is open-source under MIT license.
 
 
 Indices and tables

@@ -1,23 +1,39 @@
 import base64
+from collections import OrderedDict
+from datetime import timedelta
+import logging
 
-from django.core import validators
 from django.core.exceptions import ImproperlyConfigured, MultipleObjectsReturned, ObjectDoesNotExist
-from django.core.urlresolvers import reverse, resolve, Resolver404
+from django.urls import reverse, Resolver404
+from django.utils.translation import ugettext_lazy as _
 from rest_framework import serializers
 from rest_framework.fields import Field, ReadOnlyField
 
+from nodeconductor.core import utils as core_utils
 from nodeconductor.core.fields import TimestampField
 from nodeconductor.core.signals import pre_serializer_fields
 
 
+logger = logging.getLogger(__name__)
+
+
 class AuthTokenSerializer(serializers.Serializer):
     """
-    Api token serializer loosely based on DRF's default AuthTokenSerializer.
+    API token serializer loosely based on DRF's default AuthTokenSerializer.
     but with the logic of authorization is extracted to view.
     """
     # Fields are both required, non-blank and don't allow nulls by default
     username = serializers.CharField()
     password = serializers.CharField()
+
+
+# XXX: use JSONField from DRF when upgraded to 3.3+
+class JSONField(serializers.Field):
+    def to_internal_value(self, data):
+        return data
+
+    def to_representation(self, value):
+        return value
 
 
 class Base64Field(serializers.CharField):
@@ -27,26 +43,16 @@ class Base64Field(serializers.CharField):
             base64.b64decode(value)
             return value
         except TypeError:
-            raise serializers.ValidationError('This field should a be valid Base64 encoded string.')
+            raise serializers.ValidationError(_('This field should a be valid Base64 encoded string.'))
 
     def to_representation(self, value):
         value = super(Base64Field, self).to_representation(value)
         return base64.b64encode(value)
 
 
-# XXX: this field has to be replaced with default drf IPAddressField after it implementation:
-# https://github.com/tomchristie/django-rest-framework/issues/1853
-
-class IPAddressField(serializers.CharField):
-    def __init__(self, **kwargs):
-        super(IPAddressField, self).__init__(**kwargs)
-        ip_validators, _ = validators.ip_address_validators(protocol='ipv4', unpack_ipv4=False)
-        self.validators += ip_validators
-
-
 class BasicInfoSerializer(serializers.HyperlinkedModelSerializer):
     class Meta(object):
-        fields = ('url', 'name')
+        fields = ('url', 'uuid', 'name')
         extra_kwargs = {
             'url': {'lookup_field': 'uuid'},
         }
@@ -111,69 +117,47 @@ class GenericRelatedField(Field):
         request = self._get_request()
         return request.build_absolute_uri(reverse(self._get_url(obj), kwargs=kwargs))
 
-    def _format_url(self, url):
-        """
-        Removes domain and protocol from url
-        """
-        if url.startswith('http'):
-            return '/' + url.split('/', 3)[-1]
-        return url
-
-    def _get_model_from_resolve_match(self, match):
-        queryset = match.func.cls.queryset
-        if queryset is not None:
-            return queryset.model
-        else:
-            return match.func.cls.model
-
     def to_internal_value(self, data):
         """
         Restores model instance from its url
         """
-        # XXX: This circular dependency will be removed then filter_queryset_for_user
-        # will be moved to model manager method
-        from nodeconductor.structure.managers import filter_queryset_for_user
+        if not data:
+            return None
         request = self._get_request()
+        user = request.user
         try:
-            url = self._format_url(data)
-            match = resolve(url)
-            model = self._get_model_from_resolve_match(match)
-            queryset = filter_queryset_for_user(model.objects.all(), request.user)
-            obj = queryset.get(**match.kwargs)
+            obj = core_utils.instance_from_url(data, user=user)
+            model = obj.__class__
+        except ValueError:
+            raise serializers.ValidationError(_('URL is invalid: %s.') % data)
         except (Resolver404, AttributeError, MultipleObjectsReturned, ObjectDoesNotExist):
-            raise serializers.ValidationError("Can`t restore object from url: %s" % data)
+            raise serializers.ValidationError(_("Can't restore object from url: %s") % data)
         if model not in self.related_models:
-            raise serializers.ValidationError('%s object does not support such relationship' % str(obj))
+            raise serializers.ValidationError(_('%s object does not support such relationship.') % str(obj))
         return obj
 
 
 class AugmentedSerializerMixin(object):
     """
-    This mixing provides several extensions to stock Serializer class:
+    This mixin provides several extensions to stock Serializer class:
 
-    1.  Adding extra fields to serializer from dependent applications in a way
+    1.  Add extra fields to serializer from dependent applications in a way
         that doesn't introduce circular dependencies.
 
         To achieve this, dependent application should subscribe
         to pre_serializer_fields signal and inject additional fields.
 
         Example of signal handler implementation:
-            # handlers.py
-            def add_customer_name(sender, fields, **kwargs):
-                fields['customer_name'] = ReadOnlyField(source='customer.name')
 
-            # apps.py
-            class DependentAppConfig(AppConfig):
-                name = 'nodeconductor.structure_dependent'
-                verbose_name = "NodeConductor Structure Enhancements"
+        from nodeconductor.structure.serializers import CustomerSerializer
 
-                def ready(self):
-                    from nodeconductor.structure.serializers import CustomerSerializer
+        def add_customer_name(sender, fields, **kwargs):
+            fields['customer_name'] = ReadOnlyField(source='customer.name')
 
-                    pre_serializer_fields.connect(
-                        handlers.add_customer_name,
-                        sender=CustomerSerializer,
-                    )
+        pre_serializer_fields.connect(
+            handlers.add_customer_name,
+            sender=CustomerSerializer
+        )
 
     2.  Declaratively add attributes fields of related entities for ModelSerializers.
 
@@ -220,7 +204,7 @@ class AugmentedSerializerMixin(object):
                         'customer': ('uuid', 'name', 'native_name')
                     }
 
-    3,  Protect some fields from change.
+    3.  Protect some fields from change.
 
         Example:
             class ProjectSerializer(AugmentedSerializerMixin,
@@ -230,6 +214,8 @@ class AugmentedSerializerMixin(object):
                     fields = ('url', 'uuid', 'name', 'customer')
                     protected_fields = ('customer',)
 
+    4. This mixin overrides "get_extra_kwargs" method and puts "view_name" to extra_kwargs
+    or uses URL name specified in a model of serialized object.
     """
 
     def get_fields(self):
@@ -256,17 +242,7 @@ class AugmentedSerializerMixin(object):
         try:
             related_paths = self.Meta.related_paths
         except AttributeError:
-            if callable(getattr(self, 'get_related_paths', None)):
-                import warnings
-
-                warnings.warn(
-                    "get_related_paths() is deprecated. "
-                    "Inherit from AugmentedSerializerMixin and set Meta.related_paths instead.",
-                    DeprecationWarning,
-                )
-                related_paths = self.get_related_paths()
-            else:
-                return {}
+            return {}
 
         if not isinstance(self, serializers.ModelSerializer):
             raise ImproperlyConfigured(
@@ -292,6 +268,70 @@ class AugmentedSerializerMixin(object):
         except KeyError:
             return super(AugmentedSerializerMixin, self).build_unknown_field(field_name, model_class)
 
+    def get_extra_kwargs(self):
+        extra_kwargs = super(AugmentedSerializerMixin, self).get_extra_kwargs()
+
+        if hasattr(self.Meta, 'view_name'):
+            view_name = self.Meta.view_name
+        else:
+            view_name = core_utils.get_detail_view_name(self.Meta.model)
+
+        if 'url' in extra_kwargs:
+            extra_kwargs['url']['view_name'] = view_name
+        else:
+            extra_kwargs['url'] = {'view_name': view_name}
+
+        return extra_kwargs
+
+
+class RestrictedSerializerMixin(object):
+    """
+    This mixin allows to specify list of fields to be rendered by serializer.
+    It expects that request is available in serializer's context.
+    """
+
+    FIELDS_PARAM_NAME = 'field'
+
+    def get_fields(self):
+        fields = super(RestrictedSerializerMixin, self).get_fields()
+        query_params = self.context['request'].query_params
+        keys = query_params.getlist(self.FIELDS_PARAM_NAME)
+        keys = set(key for key in keys if key in fields.keys())
+        if not keys:
+            return fields
+        return OrderedDict(((key, value) for key, value in fields.items() if key in keys))
+
+
+class RequiredFieldsMixin(object):
+    """
+    This mixin allows to specify list of required fields.
+    It expects list of field names as Meta.required_fields attribute.
+    """
+    def get_fields(self):
+        fields = super(RequiredFieldsMixin, self).get_fields()
+        required_fields = getattr(self.Meta, 'required_fields') or []
+        for name in required_fields:
+            field = fields.get(name)
+            if field:
+                field.required = True
+        return fields
+
+
+class ExtraFieldOptionsMixin(object):
+    """
+    This mixin allows to specify extra fields metadata.
+    It expects dictionary of field name and options as Meta.extra_field_options attribute.
+    """
+    def get_fields(self):
+        fields = super(ExtraFieldOptionsMixin, self).get_fields()
+        extra_field_options = getattr(self.Meta, 'extra_field_options') or {}
+        for name, options in extra_field_options.items():
+            field = fields.get(name)
+            if field:
+                for key, val in options.items():
+                    setattr(field, key, val)
+        return fields
+
 
 class HyperlinkedRelatedModelSerializer(serializers.HyperlinkedModelSerializer):
     def __init__(self, **kwargs):
@@ -308,7 +348,7 @@ class HyperlinkedRelatedModelSerializer(serializers.HyperlinkedModelSerializer):
 
     def to_internal_value(self, data):
         if 'url' not in data:
-            raise serializers.ValidationError('URL has to be defined for related object')
+            raise serializers.ValidationError(_('URL has to be defined for related object.'))
         url_field = self.fields['url']
 
         # This is tricky: self.fields['url'] is the one generated
@@ -336,7 +376,7 @@ class TimestampIntervalSerializer(serializers.Serializer):
         Check that the start is before the end.
         """
         if 'start' in data and 'end' in data and data['start'] >= data['end']:
-            raise serializers.ValidationError("End must occur after start")
+            raise serializers.ValidationError(_('End must occur after start.'))
         return data
 
     # TimeInterval serializer is used for validation only. We are providing custom method for such serializers
@@ -368,14 +408,14 @@ class HistorySerializer(serializers.Serializer):
         autosplit_fields = {'start', 'end', 'points_count'}
         if ('point_list' not in attrs or not attrs['point_list']) and not autosplit_fields == set(attrs.keys()):
             raise serializers.ValidationError(
-                'Not enough parameters for historical data. '
-                '(Either "point" or "start" + "end" + "points_count" parameters have to be provided)')
+                _('Not enough parameters for historical data. '
+                  '(Either "point" or "start" + "end" + "points_count" parameters have to be provided).'))
         if 'point_list' in attrs and autosplit_fields & set(attrs.keys()):
             raise serializers.ValidationError(
-                'Too many parameters for historical data. '
-                '(Either "point" or "start" + "end" + "points_count" parameters have to be provided)')
+                _('Too many parameters for historical data. '
+                  '(Either "point" or "start" + "end" + "points_count" parameters have to be provided).'))
         if 'point_list' not in attrs and not attrs['start'] < attrs['end']:
-            raise serializers.ValidationError('Start timestamps have to be later than end timestamps')
+            raise serializers.ValidationError(_('Start timestamps have to be later than end timestamps.'))
         return attrs
 
     # History serializer is used for validation only. We are providing custom method for such serializers
@@ -389,31 +429,59 @@ class HistorySerializer(serializers.Serializer):
             return [self.validated_data['start'] + interval * i for i in range(self.validated_data['points_count'])]
 
 
-class DynamicSerializer(serializers.ModelSerializer):
-    """
-    Allows to specify additional fields for serializer.
-    Useful for managing dependencies between applications.
-    """
+class TimelineSerializer(serializers.Serializer):
+
+    INTERVAL_CHOICES = ('hour', 'day', 'week', 'month')
+
+    start_time = TimestampField(default=lambda: core_utils.timeshift(days=-1))
+    end_time = TimestampField(default=lambda: core_utils.timeshift())
+    interval = serializers.ChoiceField(choices=INTERVAL_CHOICES, default='day')
+
+    def get_date_points(self):
+        start_time = self.validated_data['start_time']
+        end_time = self.validated_data['end_time']
+        interval = self.validated_data['interval']
+
+        if interval == 'hour':
+            start_point = start_time.replace(second=0, minute=0, microsecond=0)
+            interval = timedelta(hours=1)
+        elif interval == 'day':
+            start_point = start_time.replace(hour=0, second=0, minute=0, microsecond=0)
+            interval = timedelta(days=1)
+        elif interval == 'week':
+            start_point = start_time.replace(hour=0, second=0, minute=0, microsecond=0)
+            interval = timedelta(days=7)
+        elif interval == 'month':
+            start_point = start_time.replace(hour=0, second=0, minute=0, microsecond=0)
+            interval = timedelta(days=30)
+
+        points = [start_time]
+        current_point = start_point
+        while current_point <= end_time:
+            points.append(current_point)
+            current_point += interval
+        if points[-1] != end_time:
+            points.append(end_time)
+
+        return [p for p in points if start_time <= p <= end_time]
+
+
+class BaseSummarySerializer(serializers.Serializer):
+    """ Serializer that renders each instance with its own specific serializer """
 
     @classmethod
-    def add_field(cls, field_name, model_class, options=None):
-        cls.Meta.fields += (field_name,)
-        if not hasattr(cls.Meta, '_additional_fields'):
-            cls.Meta._additional_fields = {}
-        cls.Meta._additional_fields[field_name] = (model_class, options or {})
-
-    def get_fields(self):
-        fields = super(DynamicSerializer, self).get_fields()
-        for name, field in self.Meta._additional_fields.items():
-            model_class, options = field
-            fields[name] = model_class(**options)
-        return fields
-
-    def build_unknown_field(self, field_name, model_class):
-        if field_name in self.Meta._additional_fields:
-            return self.Meta._additional_fields[field_name]
-        return super(DynamicSerializer, self).build_unknown_field(field_name, model_class)
+    def get_serializer(cls, model):
+        raise NotImplementedError('Method `get_serializer` should be implemented for SummarySerializer.')
 
     @classmethod
-    def add_to_class(cls, name, value):
-        setattr(cls, name, value)
+    def eager_load(cls, summary_queryset):
+        optimized_querysets = []
+        for queryset in summary_queryset.querysets:
+            serializer = cls.get_serializer(queryset.model)
+            optimized_querysets.append(serializer.eager_load(queryset))
+        summary_queryset.querysets = optimized_querysets
+        return summary_queryset
+
+    def to_representation(self, instance):
+        serializer = self.get_serializer(instance.__class__)
+        return serializer(instance, context=self.context).data

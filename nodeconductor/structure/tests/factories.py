@@ -9,7 +9,10 @@ import factory.fuzzy
 from rest_framework.reverse import reverse
 
 from nodeconductor.core import models as core_models
-from nodeconductor.structure import models, SupportedServices
+from nodeconductor.structure import models
+
+from . import TestConfig
+from . import models as test_models
 
 
 class UserFactory(factory.DjangoModelFactory):
@@ -27,7 +30,6 @@ class UserFactory(factory.DjangoModelFactory):
     job_title = factory.Sequence(lambda n: 'Job %s' % n)
     is_staff = False
     is_active = True
-    is_superuser = False
 
     @factory.post_generation
     def customers(self, create, extracted, **kwargs):
@@ -107,32 +109,55 @@ class ProjectFactory(factory.DjangoModelFactory):
     customer = factory.SubFactory(CustomerFactory)
 
     @classmethod
-    def get_url(cls, project=None):
+    def get_url(cls, project=None, action=None):
         if project is None:
             project = ProjectFactory()
-        return 'http://testserver' + reverse('project-detail', kwargs={'uuid': project.uuid})
+        url = 'http://testserver' + reverse('project-detail', kwargs={'uuid': project.uuid})
+        return url if action is None else url + action + '/'
 
     @classmethod
     def get_list_url(cls):
         return 'http://testserver' + reverse('project-list')
 
 
-class ProjectGroupFactory(factory.DjangoModelFactory):
+class ProjectPermissionFactory(factory.DjangoModelFactory):
     class Meta(object):
-        model = models.ProjectGroup
+        model = models.ProjectPermission
 
-    name = factory.Sequence(lambda n: 'Proj Grp %s' % n)
-    customer = factory.SubFactory(CustomerFactory)
+    project = factory.SubFactory(ProjectFactory)
+    user = factory.SubFactory(UserFactory)
+    role = models.ProjectRole.ADMINISTRATOR
 
     @classmethod
-    def get_url(cls, project_group=None):
-        if project_group is None:
-            project_group = ProjectGroupFactory()
-        return 'http://testserver' + reverse('projectgroup-detail', kwargs={'uuid': project_group.uuid})
+    def get_url(cls, permission=None, action=None):
+        if permission is None:
+            permission = ProjectPermissionFactory()
+        url = 'http://testserver' + reverse('project_permission-detail', kwargs={'pk': permission.pk})
+        return url if action is None else url + action + '/'
+
+    @classmethod
+    def get_list_url(self):
+        return 'http://testserver' + reverse('project_permission-list')
+
+
+class CustomerPermissionFactory(factory.DjangoModelFactory):
+    class Meta(object):
+        model = models.CustomerPermission
+
+    customer = factory.SubFactory(CustomerFactory)
+    user = factory.SubFactory(UserFactory)
+    role = models.CustomerRole.OWNER
+
+    @classmethod
+    def get_url(cls, permission=None, action=None):
+        if permission is None:
+            permission = CustomerPermissionFactory()
+        url = 'http://testserver' + reverse('customer_permission-detail', kwargs={'pk': permission.pk})
+        return url if action is None else url + action + '/'
 
     @classmethod
     def get_list_url(cls):
-        return 'http://testserver' + reverse('projectgroup-list')
+        return 'http://testserver' + reverse('customer_permission-list')
 
 
 class ServiceSettingsFactory(factory.DjangoModelFactory):
@@ -140,12 +165,108 @@ class ServiceSettingsFactory(factory.DjangoModelFactory):
         model = models.ServiceSettings
 
     name = factory.Sequence(lambda n: 'Settings %s' % n)
-    state = core_models.SynchronizationStates.IN_SYNC
+    state = core_models.StateMixin.States.OK
     shared = False
-    type = SupportedServices.Types.OpenStack
+    type = TestConfig.service_name
 
     @classmethod
-    def get_url(cls, settings=None):
+    def get_url(cls, settings=None, action=None):
         if settings is None:
             settings = ServiceSettingsFactory()
-        return 'http://testserver' + reverse('servicesettings-detail', kwargs={'uuid': settings.uuid})
+        url = 'http://testserver' + reverse('servicesettings-detail', kwargs={'uuid': settings.uuid})
+        return url if action is None else url + action + '/'
+
+    @classmethod
+    def get_list_url(cls):
+        return 'http://testserver' + reverse('servicesettings-list')
+
+
+class TestServiceFactory(factory.DjangoModelFactory):
+    class Meta(object):
+        model = test_models.TestService
+
+    settings = factory.SubFactory(ServiceSettingsFactory)
+    customer = factory.SubFactory(CustomerFactory)
+
+    @classmethod
+    def get_url(cls, service=None, action=None):
+        if service is None:
+            service = TestServiceFactory()
+        url = 'http://testserver' + reverse('test-detail', kwargs={'uuid': service.uuid})
+        return url if action is None else url + action + '/'
+
+    @classmethod
+    def get_list_url(cls):
+        return 'http://testserver' + reverse('test-list')
+
+
+class TestServiceProjectLinkFactory(factory.DjangoModelFactory):
+    class Meta(object):
+        model = test_models.TestServiceProjectLink
+
+    service = factory.SubFactory(TestServiceFactory)
+    project = factory.LazyAttribute(lambda spl: ProjectFactory(customer=spl.service.customer))
+
+    @classmethod
+    def get_url(cls, spl=None, action=None):
+        if spl is None:
+            spl = TestServiceProjectLinkFactory()
+        url = 'http://testserver' + reverse('test-spl-detail', kwargs={'pk': spl.pk})
+        return url if action is None else url + action + '/'
+
+    @classmethod
+    def get_list_url(cls):
+        return 'http://testserver' + reverse('test-spl-list')
+
+
+class TestNewInstanceFactory(factory.DjangoModelFactory):
+    class Meta(object):
+        model = test_models.TestNewInstance
+
+    name = factory.Sequence(lambda n: 'instance%s' % n)
+    service_project_link = factory.SubFactory(TestServiceProjectLinkFactory)
+
+    @classmethod
+    def get_url(cls, instance=None, action=None):
+        if instance is None:
+            instance = TestNewInstanceFactory()
+        url = 'http://testserver' + reverse('test-new-instances-detail', kwargs={'uuid': instance.uuid})
+        return url if action is None else url + action + '/'
+
+    @classmethod
+    def get_list_url(cls):
+        return 'http://testserver' + reverse('test-new-instances-list')
+
+
+class ServiceCertificationFactory(factory.DjangoModelFactory):
+    class Meta(object):
+        model = models.ServiceCertification
+
+    name = factory.Sequence(lambda n: 'certification%s' % n)
+    link = factory.Sequence(lambda n: 'https://www.test.com/certification%s' % n)
+    description = factory.Sequence(lambda n: 'description of the certification%s' % n)
+
+    @classmethod
+    def get_url(cls, instance=None, action=None):
+        if instance is None:
+            instance = ServiceCertificationFactory()
+        url = 'http://testserver' + reverse('service-certification-detail', kwargs={'uuid': instance.uuid})
+        return url if action is None else url + action + '/'
+
+    @classmethod
+    def get_list_url(cls):
+        return 'http://testserver' + reverse('service-certification-list')
+
+    @factory.post_generation
+    def service_settings(self, create, extracted, **kwargs):
+        if not create:
+            return
+
+        if extracted:
+            for service_settings in extracted:
+                self.service_settings.add(service_settings)
+
+
+class TestSubResourceFactory(factory.DjangoModelFactory):
+    class Meta(object):
+        model = test_models.TestSubResource

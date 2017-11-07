@@ -2,452 +2,202 @@ from __future__ import unicode_literals
 
 import logging
 
-from django.conf import settings
-from django.contrib.auth import get_user_model
-from django.db.models import Q
 from celery import shared_task
+from django.core import exceptions
+from django.db import transaction
+from django.db.utils import DatabaseError
+from django.utils import six
 
-from nodeconductor.core.tasks import transition, retry_if_false, save_error_message
-from nodeconductor.core.models import SshPublicKey, SynchronizationStates
-from nodeconductor.iaas.backend import CloudBackendError
-from nodeconductor.structure import (SupportedServices, ServiceBackendError,
-                                     ServiceBackendNotImplemented, models)
-from nodeconductor.structure.utils import deserialize_ssh_key, deserialize_user
+from nodeconductor.core import utils as core_utils, tasks as core_tasks, models as core_models
+from nodeconductor.structure import SupportedServices, models, utils, ServiceBackendError
 
 
 logger = logging.getLogger(__name__)
 
 
-@shared_task(name='nodeconductor.structure.stop_customer_resources')
-def stop_customer_resources(customer_uuid):
-    if not settings.NODECONDUCTOR.get('SUSPEND_UNPAID_CUSTOMERS'):
+@shared_task(name='nodeconductor.structure.detect_vm_coordinates_batch')
+def detect_vm_coordinates_batch(serialized_virtual_machines):
+    for vm in serialized_virtual_machines:
+        detect_vm_coordinates.delay(vm)
+
+
+@shared_task(name='nodeconductor.structure.detect_vm_coordinates')
+def detect_vm_coordinates(serialized_virtual_machine):
+
+    try:
+        vm = core_utils.deserialize_instance(serialized_virtual_machine)
+    except exceptions.ObjectDoesNotExist:
+        logger.warning('Missing virtual machine %s.', serialized_virtual_machine)
         return
 
-    customer = models.Customer.objects.get(uuid=customer_uuid)
-    for model_name, model in SupportedServices.get_resource_models().items():
-        # Shutdown active resources for debtors
-        # TODO: Consider supporting another states (like 'STARTING')
-        # TODO: Remove IaaS support (NC-645)
-        if model_name == 'IaaS.Instance':
-            resources = model.objects.filter(
-                state=model.States.ONLINE,
-                cloud_project_membership__cloud__customer=customer)
-        else:
-            resources = model.objects.filter(
-                state=model.States.ONLINE,
-                service_project_link__service__customer=customer)
-
-        for resource in resources:
-            try:
-                backend = resource.get_backend()
-                backend.stop()
-            except NotImplementedError:
-                continue
-
-
-@shared_task(name='nodeconductor.structure.recover_erred_services')
-def recover_erred_services(service_project_links=None):
-    if service_project_links is not None:
-        erred_spls = models.ServiceProjectLink.from_string(service_project_links)
-    else:
-        for service_type, service in SupportedServices.get_service_models().items():
-            # TODO: Remove IaaS support (NC-645)
-            is_iaas = service_type == SupportedServices.Types.IaaS
-
-            query = Q(state=SynchronizationStates.ERRED)
-            if is_iaas:
-                query |= Q(cloud__state=SynchronizationStates.ERRED)
-            else:
-                query |= Q(service__settings__state=SynchronizationStates.ERRED)
-
-            erred_spls = service['service_project_link'].objects.filter(query)
-
-    for spl in erred_spls:
-        recover_erred_service.delay(spl.to_string(), is_iaas=spl._meta.app_label == 'iaas')
-
-
-@shared_task(name='nodeconductor.structure.sync_service_settings')
-def sync_service_settings(settings_uuids=None):
-    settings = models.ServiceSettings.objects.all()
-    if settings_uuids:
-        if not isinstance(settings_uuids, (list, tuple)):
-            settings_uuids = [settings_uuids]
-        settings = settings.filter(uuid__in=settings_uuids)
-    else:
-        settings = settings.filter(state=SynchronizationStates.IN_SYNC)
-
-    for obj in settings:
-        settings_uuid = obj.uuid.hex
-        if obj.state == SynchronizationStates.IN_SYNC:
-            obj.schedule_syncing()
-            obj.save()
-
-            begin_syncing_service_settings.apply_async(
-                args=(settings_uuid,),
-                link=sync_service_settings_succeeded.si(settings_uuid),
-                link_error=sync_service_settings_failed.si(settings_uuid))
-        elif obj.state == SynchronizationStates.CREATION_SCHEDULED:
-            begin_creating_service_settings.apply_async(
-                args=(settings_uuid,),
-                link=sync_service_settings_succeeded.si(settings_uuid),
-                link_error=sync_service_settings_failed.si(settings_uuid))
-        else:
-            logger.warning('Cannot sync service settings %s from state %s', obj.name, obj.state)
-
-
-@shared_task
-@transition(models.ServiceSettings, 'begin_recovering')
-@save_error_message
-def begin_recovering_erred_service_settings(settings_uuid, transition_entity=None):
-    settings = models.ServiceSettings.objects.get(uuid=settings_uuid)
-
     try:
-        backend = settings.get_backend()
-        is_active = backend.ping()
-    except ServiceBackendNotImplemented:
-        is_active = False
+        coordinates = vm.detect_coordinates()
+    except utils.GeoIpException as e:
+        logger.warning('Unable to detect coordinates for virtual machines %s: %s.', serialized_virtual_machine, e)
+        return
 
-    if is_active:
-        settings.set_in_sync()
-        settings.error_message = ''
-        settings.save()
-        logger.info('Service settings %s successfully recovered.' % settings.name)
-    else:
-        settings.set_erred()
-        settings.error_message = 'Failed to ping service settings %s' % settings.name
-        settings.save()
-        logger.info('Failed to recover service settings %s.' % settings.name)
+    if coordinates:
+        vm.latitude = coordinates.latitude
+        vm.longitude = coordinates.longitude
+        vm.save(update_fields=['latitude', 'longitude'])
 
 
-@shared_task(name='nodeconductor.structure.recover_service_settings')
-def recover_erred_service_settings(settings_uuids=None):
-    settings_list = models.ServiceSettings.objects.all()
-    if settings_uuids:
-        if not isinstance(settings_uuids, (list, tuple)):
-            settings_uuids = [settings_uuids]
-        settings_list = settings_list.filter(uuid__in=settings_uuids)
-    else:
-        settings_list = settings_list.filter(state=SynchronizationStates.ERRED)
-
-    for settings in settings_list:
-        if settings.state == SynchronizationStates.ERRED:
-            settings_uuid = settings.uuid.hex
-            begin_recovering_erred_service_settings.delay(settings_uuid)
-        else:
-            logger.warning('Cannot recover service settings %s from state %s', settings.name, settings.state)
+@shared_task(name='nodeconductor.structure.check_expired_permissions')
+def check_expired_permissions():
+    for cls in models.BasePermission.get_all_models():
+        for permission in cls.get_expired():
+            permission.revoke()
 
 
-@shared_task(name='nodeconductor.structure.sync_service_project_links', max_retries=120, default_retry_delay=5)
-@retry_if_false
-def sync_service_project_links(service_project_links=None, quotas=None, initial=False):
-    if service_project_links is not None:
-        link_objects = models.ServiceProjectLink.from_string(service_project_links)
-        # Ignore iaas cloud project membership because it does not support default sync flow
-        link_objects = [lo for lo in link_objects if lo._meta.app_label != 'iaas']
-    else:
-        # Ignore iaas cloud project membership because it does not support default sync flow
-        spl_models = [model for model in models.ServiceProjectLink.get_all_models() if model._meta.app_label != 'iaas']
-        link_objects = sum(
-            [list(model.objects.filter(state=SynchronizationStates.IN_SYNC)) for model in spl_models], [])
+class ConnectSharedSettingsTask(core_tasks.Task):
 
-    if not link_objects:
-        return True
+    def execute(self, service_settings):
+        logger.debug('About to connect service settings "%s" to all available customers' % service_settings.name)
+        if not service_settings.shared:
+            raise ValueError('It is impossible to connect non-shared settings')
+        service_model = SupportedServices.get_service_models()[service_settings.type]['service']
 
-    for obj in link_objects:
-        service_project_link_str = obj.to_string()
-        if initial:
-            # Ignore SPLs with ERRED service settings
-            if obj.service.settings.state == SynchronizationStates.ERRED:
-                break
-            # For newly created SPLs make sure their settings in stable state, retry otherwise
-            if obj.service.settings.state != SynchronizationStates.IN_SYNC:
-                return False
+        with transaction.atomic():
+            for customer in models.Customer.objects.all():
+                defaults = {'available_for_all': True}
+                service, _ = service_model.objects.get_or_create(
+                    customer=customer, settings=service_settings, defaults=defaults)
 
-            if obj.state == SynchronizationStates.NEW:
-                obj.schedule_creating()
-                obj.save()
-            elif obj.state != SynchronizationStates.CREATION_SCHEDULED:
-                # Don't sync already created SPL during initial phase
-                return True
-
-            begin_syncing_service_project_links.apply_async(
-                args=(service_project_link_str,),
-                kwargs={'quotas': quotas, 'initial': True, 'transition_method': 'begin_creating'},
-                link=sync_service_project_link_succeeded.si(service_project_link_str),
-                link_error=sync_service_project_link_failed.si(service_project_link_str))
-
-        elif obj.state == SynchronizationStates.IN_SYNC:
-            obj.schedule_syncing()
-            obj.save()
-
-            begin_syncing_service_project_links.apply_async(
-                args=(service_project_link_str,),
-                kwargs={'quotas': quotas, 'initial': False},
-                link=sync_service_project_link_succeeded.si(service_project_link_str),
-                link_error=sync_service_project_link_failed.si(service_project_link_str))
-
-        else:
-            logger.warning('Cannot sync SPL %s from state %s', obj.id, obj.state)
-
-    return True
+                service_project_link_model = service.projects.through
+                for project in service.customer.projects.all():
+                    service_project_link_model.objects.get_or_create(project=project, service=service)
+        logger.info('Successfully connected service settings "%s" to all available customers' % service_settings.name)
 
 
-@shared_task
-@transition(models.ServiceSettings, 'begin_syncing')
-@save_error_message
-def begin_syncing_service_settings(settings_uuid, transition_entity=None):
-    settings = transition_entity
-    try:
-        backend = settings.get_backend()
-        backend.sync()
-    except ServiceBackendNotImplemented:
-        pass
+class BackgroundPullTask(core_tasks.BackgroundTask):
+    """ Pull information about object from backend. Method "pull" should be implemented.
 
+        Task marks object as ERRED if pull failed and recovers it if pull succeed.
+    """
 
-@shared_task
-@transition(models.ServiceSettings, 'begin_creating')
-@save_error_message
-def begin_creating_service_settings(settings_uuid, transition_entity=None):
-    settings = transition_entity
-    try:
-        backend = settings.get_backend()
-        backend.sync()
-    except ServiceBackendNotImplemented:
-        pass
-
-
-@shared_task
-@transition(models.ServiceSettings, 'set_in_sync')
-def sync_service_settings_succeeded(settings_uuid, transition_entity=None):
-    pass
-
-
-@shared_task
-@transition(models.ServiceSettings, 'set_erred')
-def sync_service_settings_failed(settings_uuid, transition_entity=None):
-    pass
-
-
-@shared_task
-def begin_syncing_service_project_links(service_project_link_str, quotas=None, initial=False,
-                                        transition_entity=None, transition_method='begin_syncing'):
-    spl_model, spl_pk = models.ServiceProjectLink.parse_model_string(service_project_link_str)
-
-    @transition(spl_model, transition_method)
-    @save_error_message
-    def process(service_project_link_pk, quotas=None, transition_entity=None):
-        service_project_link = transition_entity
+    def run(self, serialized_instance):
+        instance = core_utils.deserialize_instance(serialized_instance)
         try:
-            backend = service_project_link.get_backend()
-            if quotas:
-                backend.sync_quotas(service_project_link, quotas)
-            else:
-                backend.sync_link(service_project_link, is_initial=initial)
-        except ServiceBackendNotImplemented:
-            pass
-
-    process(spl_pk, quotas=quotas)
-
-
-@shared_task
-def sync_service_project_link_succeeded(service_project_link_str):
-    spl_model, spl_pk = models.ServiceProjectLink.parse_model_string(service_project_link_str)
-
-    @transition(spl_model, 'set_in_sync')
-    def process(service_project_link_pk, transition_entity=None):
-        pass
-
-    process(spl_pk)
-
-
-@shared_task
-def sync_service_project_link_failed(service_project_link_str):
-    spl_model, spl_pk = models.ServiceProjectLink.parse_model_string(service_project_link_str)
-
-    @transition(spl_model, 'set_erred')
-    def process(service_project_link_pk, transition_entity=None):
-        pass
-
-    process(spl_pk)
-
-
-@shared_task
-def recover_erred_service(service_project_link_str, is_iaas=False):
-    try:
-        spl = next(models.ServiceProjectLink.from_string(service_project_link_str))
-    except StopIteration:
-        logger.warning('Missing service project link %s.', service_project_link_str)
-        return
-
-    settings = spl.cloud if is_iaas else spl.service.settings
-
-    try:
-        backend = spl.get_backend()
-        if is_iaas:
-            try:
-                if spl.state == SynchronizationStates.ERRED:
-                    backend.create_session(membership=spl)
-                if spl.cloud.state == SynchronizationStates.ERRED:
-                    backend.create_session(keystone_url=spl.cloud.auth_url)
-            except CloudBackendError:
-                is_active = False
-            else:
-                is_active = True
+            self.pull(instance)
+        except ServiceBackendError as e:
+            self.on_pull_fail(instance, e)
         else:
-            is_active = backend.ping()
-    except (ServiceBackendError, ServiceBackendNotImplemented):
-        is_active = False
+            self.on_pull_success(instance)
 
-    if is_active:
-        for entity in (spl, settings):
-            if entity.state == SynchronizationStates.ERRED:
-                entity.set_in_sync_from_erred()
-                entity.save()
-    else:
-        logger.info('Failed to recover service settings %s.' % settings)
+    def is_equal(self, other_task, serialized_instance):
+        return self.name == other_task.get('name') and serialized_instance in other_task.get('args', [])
 
+    def pull(self, instance):
+        """ Pull instance from backend.
 
-@shared_task(name='nodeconductor.structure.push_ssh_public_keys')
-def push_ssh_public_keys(service_project_links):
-    link_objects = models.ServiceProjectLink.from_string(service_project_links)
-    for link in link_objects:
-        str_link = link.to_string()
+            This method should not handle backend exception.
+        """
+        raise NotImplementedError('Pull task should implement pull method.')
 
-        ssh_keys = SshPublicKey.objects.filter(user__groups__projectrole__project=link.project)
-        if not ssh_keys.exists():
-            logger.debug('There are no SSH public keys to push for link %s', str_link)
-            continue
+    def on_pull_fail(self, instance, error):
+        error_message = six.text_type(error)
+        self.log_error_message(instance, error_message)
+        try:
+            self.set_instance_erred(instance, error_message)
+        except DatabaseError as e:
+            logger.debug(e, exc_info=True)
 
-        for key in ssh_keys:
-            push_ssh_public_key.delay(key.uuid.hex, str_link)
+    def on_pull_success(self, instance):
+        if instance.state == instance.States.ERRED:
+            instance.recover()
+            instance.error_message = ''
+            instance.save(update_fields=['state', 'error_message'])
 
+    def log_error_message(self, instance, error_message):
+        logger_message = 'Failed to pull %s %s (PK: %s). Error: %s' % (
+            instance.__class__.__name__, instance.name, instance.pk, error_message)
+        if instance.state == instance.States.ERRED:  # report error on debug level if instance already was erred.
+            logger.debug(logger_message)
+        else:
+            logger.error(logger_message, exc_info=True)
 
-@shared_task(name='nodeconductor.structure.push_ssh_public_key', max_retries=120, default_retry_delay=30)
-@retry_if_false
-def push_ssh_public_key(ssh_public_key_uuid, service_project_link_str):
-    try:
-        public_key = SshPublicKey.objects.get(uuid=ssh_public_key_uuid)
-    except SshPublicKey.DoesNotExist:
-        logger.warning('Missing public key %s.', ssh_public_key_uuid)
-        return True
-    try:
-        service_project_link = next(models.ServiceProjectLink.from_string(service_project_link_str))
-    except StopIteration:
-        logger.warning('Missing service project link %s.', service_project_link_str)
-        return True
-
-    if service_project_link.state != SynchronizationStates.IN_SYNC:
-        logger.debug(
-            'Not pushing public keys for service project link %s which is in state %s.',
-            service_project_link_str, service_project_link.get_state_display())
-
-        if service_project_link.state != SynchronizationStates.ERRED:
-            logger.debug(
-                'Rescheduling synchronisation of keys for link %s in state %s.',
-                service_project_link_str, service_project_link.get_state_display())
-
-            # retry a task if service project link is not in a sane state
-            return False
-
-    backend = service_project_link.get_backend()
-    try:
-        backend.add_ssh_key(public_key, service_project_link)
-        logger.info(
-            'SSH key %s has been pushed to service project link %s.',
-            public_key.uuid, service_project_link_str)
-    except ServiceBackendNotImplemented:
-        pass
-    except (ServiceBackendError, CloudBackendError):
-        logger.warning(
-            'Failed to push SSH key %s to service project link %s.',
-            public_key.uuid, service_project_link_str,
-            exc_info=1)
-
-    return True
+    def set_instance_erred(self, instance, error_message):
+        """ Mark instance as erred and save error message """
+        instance.set_erred()
+        instance.error_message = error_message
+        instance.save(update_fields=['state', 'error_message'])
 
 
-@shared_task(name='nodeconductor.structure.remove_ssh_public_key')
-def remove_ssh_public_key(key_data, service_project_link_str):
-    public_key = deserialize_ssh_key(key_data)
-    try:
-        service_project_link = next(models.ServiceProjectLink.from_string(service_project_link_str))
-    except StopIteration:
-        logger.warning('Missing service project link %s.', service_project_link_str)
-        return True
+class BackgroundListPullTask(core_tasks.BackgroundTask):
+    """ Schedules pull task for each stable object of the model. """
+    model = NotImplemented
+    pull_task = NotImplemented
 
-    try:
-        backend = service_project_link.get_backend()
-        backend.remove_ssh_key(public_key, service_project_link)
-        logger.info(
-            'SSH key %s has been removed from service project link %s.',
-            public_key.uuid, service_project_link_str)
-    except ServiceBackendNotImplemented:
-        pass
-    except (ServiceBackendError, CloudBackendError):
-        logger.warning(
-            'Failed to remove SSH key %s from service project link %s.',
-            public_key.uuid, service_project_link_str,
-            exc_info=1)
+    def is_equal(self, other_task):
+        return self.name == other_task.get('name')
+
+    def get_pulled_objects(self):
+        States = self.model.States
+        return self.model.objects.filter(state__in=[States.ERRED, States.OK]).exclude(backend_id='')
+
+    def run(self):
+        for instance in self.get_pulled_objects():
+            serialized = core_utils.serialize_instance(instance)
+            self.pull_task().delay(serialized)
 
 
-@shared_task(name='nodeconductor.structure.add_user', max_retries=120, default_retry_delay=30)
-@retry_if_false
-def add_user(user_uuid, service_project_link_str):
-    try:
-        user = get_user_model().objects.get(uuid=user_uuid)
-    except get_user_model().DoesNotExist:
-        logger.warning('Missing user %s.', user_uuid)
-        return True
-    try:
-        service_project_link = next(models.ServiceProjectLink.from_string(service_project_link_str))
-    except StopIteration:
-        logger.warning('Missing service project link %s.', service_project_link_str)
+class ServiceSettingsBackgroundPullTask(BackgroundPullTask):
+
+    def pull(self, service_settings):
+        backend = service_settings.get_backend()
+        backend.sync()
+
+
+class ServiceSettingsListPullTask(BackgroundListPullTask):
+    name = 'nodeconductor.structure.ServiceSettingsListPullTask'
+    model = models.ServiceSettings
+    pull_task = ServiceSettingsBackgroundPullTask
+
+    def get_pulled_objects(self):
+        States = self.model.States
+        return self.model.objects.filter(state__in=[States.ERRED, States.OK])
+
+
+class RetryUntilAvailableTask(core_tasks.Task):
+    max_retries = 300
+    default_retry_delay = 5
+
+    def pre_execute(self, instance):
+        if not self.is_available(instance):
+            self.retry()
+        super(RetryUntilAvailableTask, self).pre_execute(instance)
+
+    def is_available(self, instance):
         return True
 
-    if service_project_link.state != SynchronizationStates.IN_SYNC:
-        logger.debug(
-            'Not adding users for service project link %s which is in state %s.',
-            service_project_link_str, service_project_link.get_state_display())
 
-        if service_project_link.state != SynchronizationStates.ERRED:
-            logger.debug(
-                'Rescheduling synchronisation of users for link %s in state %s.',
-                service_project_link_str, service_project_link.get_state_display())
+class BaseThrottleProvisionTask(RetryUntilAvailableTask):
+    """
+    Before starting resource provisioning, count how many resources
+    are already in "creating" state and delay provisioning if there are too many of them.
+    """
+    DEFAULT_LIMIT = 4
 
-            # retry a task if service project link is not in a sane state
-            return False
+    def is_available(self, resource):
+        usage = self.get_usage(resource)
+        limit = self.get_limit(resource)
+        return usage <= limit
 
-    backend = service_project_link.get_backend()
-    try:
-        backend.add_user(user, service_project_link)
-        logger.info(
-            'User %s has been added to service project link %s.',
-            user.uuid, service_project_link_str)
-    except ServiceBackendNotImplemented:
-        pass
-    except (ServiceBackendError, CloudBackendError):
-        logger.warning(
-            'Failed to add user %s for service project link %s',
-            user.uuid, service_project_link_str,
-            exc_info=1)
+    def get_usage(self, resource):
+        service_settings = resource.service_project_link.service.settings
+        model_class = resource._meta.model
+        return model_class.objects.filter(
+            state=core_models.StateMixin.States.CREATING,
+            service_project_link__service__settings=service_settings).count()
 
-    return True
+    def get_limit(self, resource):
+        return self.DEFAULT_LIMIT
 
 
-@shared_task(name='nodeconductor.structure.remove_user')
-def remove_user(user_data, service_project_link_str):
-    user = deserialize_user(user_data)
-    try:
-        service_project_link = next(models.ServiceProjectLink.from_string(service_project_link_str))
-    except StopIteration:
-        logger.warning('Missing service project link %s.', service_project_link_str)
-        return True
+class ThrottleProvisionTask(BaseThrottleProvisionTask, core_tasks.BackendMethodTask):
+    pass
 
-    try:
-        backend = service_project_link.get_backend()
-        backend.remove_user(user, service_project_link)
-        logger.info(
-            'User %s has been removed from service project link %s.',
-            user.uuid, service_project_link_str)
-    except ServiceBackendNotImplemented:
-        pass
+
+class ThrottleProvisionStateTask(BaseThrottleProvisionTask, core_tasks.StateTransitionTask):
+    pass
+

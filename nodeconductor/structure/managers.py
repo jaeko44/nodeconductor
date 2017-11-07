@@ -2,11 +2,13 @@ from operator import or_
 
 from django.db import models
 
+from nodeconductor.core.managers import GenericKeyMixin, SummaryQuerySet
+
 
 def filter_queryset_for_user(queryset, user):
-    filtered_relations = ('customer', 'project', 'project_group')
+    filtered_relations = ('customer', 'project')
 
-    if user is None or user.is_staff:
+    if user is None or user.is_staff or user.is_support:
         return queryset
 
     def create_q(entity):
@@ -23,11 +25,12 @@ def filter_queryset_for_user(queryset, user):
             prefix = path + '__'
 
         kwargs = {
-            prefix + 'roles__permission_group__user': user,
+            prefix + 'permissions__user': user,
+            prefix + 'permissions__is_active': True
         }
 
         if role:
-            kwargs[prefix + 'roles__role_type'] = role
+            kwargs[prefix + 'permissions__role'] = role
 
         return models.Q(**kwargs)
 
@@ -103,7 +106,7 @@ class StructureQueryset(models.QuerySet):
     def _filter_by_custom_fields(self, **kwargs):
         # traverse over filter arguments in search of custom fields
         args = {}
-        fields = self.model._meta.get_all_field_names()
+        fields = [f.name for f in self.model._meta.get_fields()]
         for field, val in kwargs.items():
             base_field = field.split('__')[0]
             if base_field in fields:
@@ -137,3 +140,40 @@ class StructureQueryset(models.QuerySet):
 
 
 StructureManager = models.Manager.from_queryset(StructureQueryset)
+
+
+class ResourceSummaryQuerySet(SummaryQuerySet):
+    # Hack for permissions
+    @property
+    def model(self):
+        from nodeconductor.structure.models import ResourceMixin
+        return ResourceMixin
+
+
+class ServiceSummaryQuerySet(SummaryQuerySet):
+    # Hack for permissions
+    @property
+    def model(self):
+        from nodeconductor.structure.models import Service
+        return Service
+
+
+class ServiceSettingsManager(GenericKeyMixin, models.Manager):
+    """ Allows to filter and get service settings by generic key """
+
+    def get_available_models(self):
+        """ Return list of models that are acceptable """
+        from nodeconductor.structure.models import ResourceMixin
+        return ResourceMixin.get_all_models()
+
+
+class SharedServiceSettingsManager(ServiceSettingsManager):
+
+    def get_queryset(self):
+        return super(SharedServiceSettingsManager, self).get_queryset().filter(shared=True)
+
+
+class PrivateServiceSettingsManager(ServiceSettingsManager):
+
+    def get_queryset(self):
+        return super(PrivateServiceSettingsManager, self).get_queryset().filter(shared=False)

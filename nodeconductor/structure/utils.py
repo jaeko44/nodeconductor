@@ -1,37 +1,74 @@
-from django.contrib.auth import get_user_model
+import collections
+import requests
 
-from nodeconductor.core.models import SshPublicKey
+from django.db import models
+from django.db.migrations.topological_sort import stable_topological_sort
+from django.utils.lru_cache import lru_cache
 
-
-def serialize_ssh_key(ssh_key):
-    return {
-        'name': ssh_key.name,
-        'user_id': ssh_key.user_id,
-        'fingerprint': ssh_key.fingerprint,
-        'public_key': ssh_key.public_key,
-        'uuid': ssh_key.uuid.hex
-    }
+from . import SupportedServices
 
 
-def deserialize_ssh_key(data):
-    return SshPublicKey(
-        name=data['name'],
-        user_id=data['user_id'],
-        fingerprint=data['fingerprint'],
-        public_key=data['public_key'],
-        uuid=data['uuid']
+Coordinates = collections.namedtuple('Coordinates', ('latitude', 'longitude'))
+
+
+class GeoIpException(Exception):
+    pass
+
+
+def get_coordinates_by_ip(ip_address):
+    url = 'http://freegeoip.net/json/{}'.format(ip_address)
+
+    try:
+        response = requests.get(url)
+    except requests.exceptions.RequestException as e:
+        raise GeoIpException("Request to geoip API %s failed: %s" % (url, e))
+
+    if response.ok:
+        data = response.json()
+        return Coordinates(latitude=data['latitude'],
+                           longitude=data['longitude'])
+    else:
+        params = (url, response.status_code, response.text)
+        raise GeoIpException("Request to geoip API %s failed: %s %s" % params)
+
+
+@lru_cache(maxsize=1)
+def get_sorted_dependencies(service_model):
+    """
+    Returns list of application models in topological order.
+    It is used in order to correctly delete dependent resources.
+    """
+    app_models = list(service_model._meta.app_config.get_models())
+    dependencies = {model: set() for model in app_models}
+    relations = (
+        relation
+        for model in app_models
+        for relation in model._meta.related_objects
+        if relation.on_delete in (models.PROTECT, models.CASCADE)
     )
+    for rel in relations:
+        dependencies[rel.model].add(rel.related_model)
+    return stable_topological_sort(app_models, dependencies)
 
 
-def serialize_user(user):
-    return {
-        'username': user.username,
-        'email': user.email
-    }
+def sort_dependencies(service_model, resources):
+    ordering = get_sorted_dependencies(service_model)
+    resources.sort(key=lambda resource: ordering.index(resource._meta.model))
+    return resources
 
 
-def deserialize_user(data):
-    return get_user_model()(
-        username=data['username'],
-        email=data['email']
-    )
+@lru_cache(maxsize=1)
+def get_all_services_field_names():
+    result = dict()
+    service_models = SupportedServices.get_service_models()
+
+    for service_name in service_models:
+        service_model = service_models[service_name]['service']
+        service_serializer = SupportedServices.get_service_serializer(service_model)
+        fields = service_serializer.SERVICE_ACCOUNT_FIELDS
+        if fields is NotImplemented:
+            fields = {}
+
+        result[service_name] = fields.keys()
+
+    return result

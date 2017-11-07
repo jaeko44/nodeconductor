@@ -1,5 +1,5 @@
 from django.test.utils import override_settings
-from django.core.urlresolvers import reverse
+from django.urls import reverse
 from rest_framework import status
 from rest_framework import test
 
@@ -10,7 +10,7 @@ from nodeconductor.structure.images import dummy_image
 
 
 @override_settings(MEDIA_URL='/media/')
-class ImageUploadTest(test.APISimpleTestCase):
+class ImageUploadTest(test.APITransactionTestCase):
     def setUp(self):
         self.staff = UserFactory(is_staff=True)
         self.owner = UserFactory()

@@ -5,7 +5,13 @@
 .. include:: fsm.rst
 .. include:: structure.rst
 .. include:: groups.rst
-.. include:: license.rst
-.. include:: support.rst
 .. include:: events/intro.rst
-
+.. include:: resource-actions.rst
+.. include:: authentication.rst
+.. include:: pagination.rst
+.. include:: permission_management.rst
+.. include:: import-openstack-instance.rst
+.. include:: monitoring-as-a-service.rst
+.. include:: dr-backups.rst
+.. include:: version.rst
+.. include:: cost-tracking.rst

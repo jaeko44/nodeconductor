@@ -2,20 +2,21 @@
 from __future__ import unicode_literals
 
 from django.db import models, migrations
-import jsonfield.fields
+import nodeconductor.core.fields
 
 
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('structure', '0030_customer_app_vm_count'),
+        # migrations 29 and 30 where deleted.
+        ('structure', '0028_servicesettings_service_type2'),
     ]
 
     operations = [
         migrations.AlterField(
             model_name='servicesettings',
             name='options',
-            field=jsonfield.fields.JSONField(default={}, help_text='Extra options'),
+            field=nodeconductor.core.fields.JSONField(default={}, help_text='Extra options'),
             preserve_default=True,
         ),
     ]
